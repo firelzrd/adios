@@ -1,26 +1,47 @@
-From cfb7587ebb2f7ca355a4218c4d76b4ac31a9293f Mon Sep 17 00:00:00 2001
+From e4aa85028e38eabc6d5df63c3e3f46ce8e189942 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 5 Jan 2025 07:33:00 +0900
-Subject: [PATCH] ADIOS Early Prototype 1
+Date: Sun, 5 Jan 2025 10:25:27 +0900
+Subject: [PATCH] ADIOS Early Prototype 2
 
 ---
- block/Makefile |   8 +
- block/adios.c  | 673 +++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 681 insertions(+)
+ block/Kconfig.iosched |   9 +
+ block/Makefile        |   8 +
+ block/adios.c         | 723 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 740 insertions(+)
  create mode 100644 block/adios.c
 
+diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
+index 27f11320b8..dd9af8cd7b 100644
+--- a/block/Kconfig.iosched
++++ b/block/Kconfig.iosched
+@@ -16,6 +16,15 @@ config MQ_IOSCHED_KYBER
+ 	  synchronous writes, it will self-tune queue depths to achieve that
+ 	  goal.
+ 
++config MQ_IOSCHED_ADIOS
++	tristate "Adaptive Deadline I/O scheduler"
++	default y
++	help
++	  ADIOS is a multi-queue I/O scheduler for the Linux kernel, based on
++	  mq-deadline and Kyber, with learning-based adaptive latency control.
++	  It aims to provide low latency for synchronous requests while
++	  maintaining high throughput for asynchronous requests and bulk I/O.
++
+ config IOSCHED_BFQ
+ 	tristate "BFQ I/O scheduler"
+ 	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index ddfd21c1a9..5d9b5482fd 100644
+index ddfd21c1a9..ebe14e94d1 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -25,6 +25,7 @@ obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
+@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+ obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
+ obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
++obj-$(CONFIG_MQ_IOSCHED_ADIOS)	+= adios.o
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
-+obj-m				+= adios.o
  
- obj-$(CONFIG_BLK_DEV_INTEGRITY) += bio-integrity.o blk-integrity.o t10-pi.o
- obj-$(CONFIG_BLK_MQ_PCI)	+= blk-mq-pci.o
 @@ -38,3 +39,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
@@ -34,10 +55,10 @@ index ddfd21c1a9..5d9b5482fd 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..3cf354df94
+index 0000000000..5f01bfa535
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,673 @@
+@@ -0,0 +1,723 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -356,22 +377,62 @@ index 0000000000..3cf354df94
 +	ad->total_predicted_latency = 0;
 +}
 +
-+/*
-+ * adios_dispatch_requests selects the best request according to
-+ * read/write expire, etc and with a start time <= @latest_start.
-+ */
-+static struct request *__ad_dispatch_request(struct ad_data *ad)
++static bool adios_fill_batch_queues(struct ad_data *ad)
 +{
-+	struct request *rq;
++	unsigned int count = 0;
 +
-+	lockdep_assert_held(&ad->lock);
++	adios_init_batch_queues(ad);
 +
-+	if (RB_EMPTY_ROOT(&ad->sort_list))
++	while (true) {
++		struct request *rq = adios_next_request(ad);
++		if (!rq)
++			break;
++
++		struct ad_rq_data *rd = rq_data(rq);
++		unsigned int optype = adios_optype(rq);
++		u64 lat = ad->total_predicted_latency + rd->predicted_latency;
++
++		// Check batch size and total predicted latency
++		if (count && (ad->batch_count[optype] >= adios_max_batch_size[optype] ||
++			lat > GLOBAL_LATENCY_TARGET)) {
++			break;
++		}
++
++		adios_remove_request(ad, rq);
++
++		// Add request to the corresponding batch queue
++		list_add_tail(&rq->queuelist, &ad->batch_queue[optype]);
++		ad->batch_count[optype]++;
++		ad->total_predicted_latency = lat;
++		count++;
++	}
++
++	return count;
++}
++
++static struct request *ad_dispatch_from_bq(struct ad_data *ad)
++{
++	struct request *rq = NULL;
++	bool retry = false;
++
++	do {
++		// Check if there are any requests in the batch queues
++		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
++			if (!list_empty(&ad->batch_queue[i])) {
++				rq = list_first_entry(&ad->batch_queue[i], struct request, queuelist);
++				list_del_init(&rq->queuelist);
++				goto found;
++			}
++		}
++
++		// If batch queues are empty, fill them
++		if (retry || adios_fill_batch_queues(ad))
++			retry = !retry;
++	} while(retry);
++
++	if (!rq)
 +		return NULL;
-+
-+	rq = adios_next_request(ad);
-+	adios_remove_request(ad, rq);
-+
++found:
 +	ad->stats.dispatched++;
 +	rq->rq_flags |= RQF_STARTED;
 +	return rq;
@@ -390,9 +451,8 @@ index 0000000000..3cf354df94
 +	struct ad_data *ad = hctx->queue->elevator->elevator_data;
 +	struct request *rq;
 +
-+	spin_lock(&ad->lock);
-+	rq = __ad_dispatch_request(ad);
-+	spin_unlock(&ad->lock);
++	guard(spinlock)(&ad->lock);
++	rq = ad_dispatch_from_bq(ad);
 +
 +	return rq;
 +}
@@ -633,13 +693,24 @@ index 0000000000..3cf354df94
 +	rq->elv.priv[1] = rd;
 +}
 +
++static void ad_completed_request(struct request *rq, u64 now)
++{
++	struct ad_data *ad = rq->q->elevator->elevator_data;
++	struct ad_rq_data *rd = rq_data(rq);
++
++	ad->total_predicted_latency -= rd->predicted_latency;
++	unsigned int optype = adios_optype(rq);
++	u64 latency = now - rq->io_start_time_ns;
++	latency_model_input(&ad->latency_model[optype], rd->block_size, latency);
++	mod_timer(&ad->timer, jiffies + msecs_to_jiffies(100));
++}
++
 +/*
 + * Callback from inside blk_mq_free_request().
 + */
 +static void ad_finish_request(struct request *rq)
 +{
 +	struct ad_data *ad = rq->q->elevator->elevator_data;
-+	struct ad_rq_data *rd = rq_data(rq);
 +
 +	/*
 +	 * The block layer core may call ad_finish_request() without having
@@ -647,11 +718,6 @@ index 0000000000..3cf354df94
 +	 * scheduling. See also blk_mq_request_bypass_insert().
 +	 */
 +	if (rq->elv.priv[0]) {
-+		unsigned int optype = adios_optype(rq);
-+		u64 latency = blk_time_get_ns() - rq->start_time_ns;
-+		latency_model_input(&ad->latency_model[optype], rd->block_size, latency);
-+		mod_timer(&ad->timer, jiffies + msecs_to_jiffies(100));
-+
 +		kfree(rq_data(rq));
 +		rq->elv.priv[0] = NULL;
 +		atomic_inc(&ad->stats.completed);
@@ -660,6 +726,10 @@ index 0000000000..3cf354df94
 +
 +static bool ad_has_work_for_ad(struct ad_data *ad)
 +{
++	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
++		if(!list_empty_careful(&ad->batch_queue[i]))
++			return true;
++
 +	return !list_empty_careful(&ad->dispatch) ||
 +		!RB_EMPTY_ROOT(&ad->sort_list);
 +}
@@ -678,6 +748,7 @@ index 0000000000..3cf354df94
 +		.insert_requests	= ad_insert_requests,
 +		.dispatch_request	= ad_dispatch_request,
 +		.prepare_request	= ad_prepare_request,
++		.completed_request	= ad_completed_request,
 +		.finish_request		= ad_finish_request,
 +		.next_request		= elv_rb_latter_request,
 +		.former_request		= elv_rb_former_request,
