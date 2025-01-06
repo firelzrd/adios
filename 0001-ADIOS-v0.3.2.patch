@@ -1,13 +1,13 @@
-From 52f4ec2a259427b5c727a7fbb4a82a8acaf9494b Mon Sep 17 00:00:00 2001
+From ba75d16890d0b68ca1eb314cc716e7fcaba3520b Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 7 Jan 2025 07:07:08 +0900
-Subject: [PATCH] ADIOS v0.3.1
+Date: Tue, 7 Jan 2025 07:45:58 +0900
+Subject: [PATCH] ADIOS v0.3.2
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 938 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 955 insertions(+)
+ block/adios.c         | 937 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 954 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..ba6f4bbd03
+index 0000000000..2bc4f896de
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,938 @@
+@@ -0,0 +1,937 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,7 @@ index 0000000000..ba6f4bbd03
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.3.1"
++#define ADIOS_VERSION "0.3.2"
 +
 +static u64 global_latency_window = 20000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -703,9 +703,8 @@ index 0000000000..ba6f4bbd03
 +		list_del_init(&rq->queuelist);
 +		ad_insert_request(hctx, rq, flags, &free);
 +	}
-+	spin_unlock(&ad->lock);
-+
 +	blk_mq_free_requests(&free);
++	spin_unlock(&ad->lock);
 +}
 +
 +/* Callback from inside blk_mq_rq_ctx_init(). */
