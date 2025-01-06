@@ -1,13 +1,13 @@
-From e4aa85028e38eabc6d5df63c3e3f46ce8e189942 Mon Sep 17 00:00:00 2001
+From 2c6f1200bb35816de81717a292fce5bda2b16b78 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 5 Jan 2025 10:25:27 +0900
-Subject: [PATCH] ADIOS Early Prototype 2
+Date: Mon, 6 Jan 2025 09:04:14 +0900
+Subject: [PATCH] ADIOS v0.1.3
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 723 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 740 insertions(+)
+ block/adios.c         | 842 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 859 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..5f01bfa535
+index 0000000000..7ab533de2c
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,842 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,7 @@ index 0000000000..5f01bfa535
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define GLOBAL_LATENCY_TARGET 20000000ULL
++static u64 global_latency_target = 20000000ULL;
 +
 +enum {
 +	ADIOS_READ,
@@ -108,14 +108,14 @@ index 0000000000..5f01bfa535
 +	}
 +}
 +
-+static const u64 adios_latency_targets[] = {
++static u64 adios_latency_targets[ADIOS_NUM_OPTYPES] = {
 +	[ADIOS_READ]    =    2ULL * NSEC_PER_MSEC,
 +	[ADIOS_WRITE]   =  500ULL * NSEC_PER_MSEC,
 +	[ADIOS_DISCARD] = 5000ULL * NSEC_PER_MSEC,
 +	[ADIOS_OTHER]   =    0ULL,
 +};
 +
-+static const unsigned int adios_max_batch_size[] = {
++static unsigned int adios_max_batch_size[ADIOS_NUM_OPTYPES] = {
 +	[ADIOS_READ]    = 16,
 +	[ADIOS_WRITE]   =  8,
 +	[ADIOS_DISCARD] =  1,
@@ -136,7 +136,6 @@ index 0000000000..5f01bfa535
 +
 +static void latency_model_input(struct latency_model *model, u64 block_size, u64 latency)
 +{
-+
 +	if (block_size > BLOCK_SIZE_THRESHOLD) {
 +		if (!model->intercept) return;
 +		model->large_sum_delay +=
@@ -394,7 +393,7 @@ index 0000000000..5f01bfa535
 +
 +		// Check batch size and total predicted latency
 +		if (count && (ad->batch_count[optype] >= adios_max_batch_size[optype] ||
-+			lat > GLOBAL_LATENCY_TARGET)) {
++			lat > global_latency_target)) {
 +			break;
 +		}
 +
@@ -561,7 +560,6 @@ index 0000000000..5f01bfa535
 +	ad->sort_list = RB_ROOT;
 +	ad->pos_list = RB_ROOT;
 +
-+	
 +	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
 +		spin_lock_init(&ad->latency_model[i].lock);
 +	timer_setup(&ad->timer, adios_timer_fn, 0);
@@ -699,6 +697,9 @@ index 0000000000..5f01bfa535
 +	struct ad_rq_data *rd = rq_data(rq);
 +
 +	ad->total_predicted_latency -= rd->predicted_latency;
++	if (!rq->io_start_time_ns)
++		return;
++
 +	unsigned int optype = adios_optype(rq);
 +	u64 latency = now - rq->io_start_time_ns;
 +	latency_model_input(&ad->latency_model[optype], rd->block_size, latency);
@@ -741,6 +742,121 @@ index 0000000000..5f01bfa535
 +	return ad_has_work_for_ad(ad);
 +}
 +
++#define SHOW_LATENCY_MODEL(name, optype)					\
++static ssize_t adios_##name##_lat_model_show(struct elevator_queue *e, char *page) \
++{									\
++	struct ad_data *ad = e->elevator_data;				\
++	struct latency_model *model = &ad->latency_model[optype];		\
++	ssize_t len = 0;						\
++	guard(spinlock)(&model->lock);					\
++	len += sprintf(page, "intercept: %llu\n", model->intercept);	\
++	len += sprintf(page + len, "slope: %llu\n", model->slope);	\
++	len += sprintf(page + len, "small_sum_delay: %llu\n", model->small_sum_delay);\
++	len += sprintf(page + len, "small_count: %llu\n", model->small_count);\
++	len += sprintf(page + len, "large_sum_delay: %llu\n", model->large_sum_delay);\
++	len += sprintf(page + len, "large_sum_block_size: %llu\n", model->large_sum_block_size);\
++	return len;							\
++}
++
++SHOW_LATENCY_MODEL(read, ADIOS_READ);
++SHOW_LATENCY_MODEL(write, ADIOS_WRITE);
++SHOW_LATENCY_MODEL(discard, ADIOS_DISCARD);
++SHOW_LATENCY_MODEL(other, ADIOS_OTHER);
++
++#define STORE_LATENCY_TARGET(name, optype)					\
++static ssize_t adios_##name##_lat_target_store(struct elevator_queue *e, const char *page, size_t count) \
++{										\
++	struct ad_data *ad = e->elevator_data;						\
++	unsigned long nsec;								\
++	int ret;									\
++											\
++	ret = kstrtoul(page, 10, &nsec);							\
++	if (ret)									\
++		return ret;									\
++											\
++	ad->latency_model[optype].intercept = 0ULL;					\
++	adios_latency_targets[optype] = nsec;						\
++											\
++	return count;									\
++}										\
++static ssize_t adios_##name##_lat_target_show(struct elevator_queue *e, char *page) \
++{										\
++	return sprintf(page, "%llu\n", adios_latency_targets[optype]);			\
++}
++
++STORE_LATENCY_TARGET(read, ADIOS_READ);
++STORE_LATENCY_TARGET(write, ADIOS_WRITE);
++STORE_LATENCY_TARGET(discard, ADIOS_DISCARD);
++STORE_LATENCY_TARGET(other, ADIOS_OTHER);
++
++#define STORE_MAX_BATCH_SIZE(name, optype)					\
++static ssize_t adios_##name##_max_batch_size_store(struct elevator_queue *e, const char *page, size_t count) \
++{										\
++	unsigned long max_batch;							\
++	int ret;									\
++											\
++	ret = kstrtoul(page, 10, &max_batch);						\
++	if (ret || max_batch == 0)							\
++		return -EINVAL;								\
++											\
++	adios_max_batch_size[optype] = max_batch;					\
++											\
++	return count;									\
++}										\
++static ssize_t adios_##name##_max_batch_size_show(struct elevator_queue *e, char *page) \
++{										\
++	return sprintf(page, "%u\n", adios_max_batch_size[optype]);				\
++}
++
++STORE_MAX_BATCH_SIZE(read, ADIOS_READ);
++STORE_MAX_BATCH_SIZE(write, ADIOS_WRITE);
++STORE_MAX_BATCH_SIZE(discard, ADIOS_DISCARD);
++STORE_MAX_BATCH_SIZE(other, ADIOS_OTHER);
++
++#define STORE_GLOBAL_LATENCY_TARGET(name)					\
++static ssize_t adios_##name##_store(struct elevator_queue *e, const char *page, size_t count) \
++{										\
++	unsigned long nsec;								\
++	int ret;									\
++											\
++	ret = kstrtoul(page, 10, &nsec);							\
++	if (ret)									\
++		return ret;									\
++											\
++	global_latency_target = nsec;							\
++											\
++	return count;									\
++}										\
++static ssize_t adios_##name##_show(struct elevator_queue *e, char *page) \
++{										\
++	return sprintf(page, "%llu\n", global_latency_target);				\
++}
++
++STORE_GLOBAL_LATENCY_TARGET(global_lat_target);
++
++#define DD_ATTR(name, show_func, store_func) \
++	__ATTR(name, 0644, show_func, store_func)
++
++static struct elv_fs_entry adios_sched_attrs[] = {
++	DD_ATTR(read_lat_model, adios_read_lat_model_show, NULL),
++	DD_ATTR(write_lat_model, adios_write_lat_model_show, NULL),
++	DD_ATTR(discard_lat_model, adios_discard_lat_model_show, NULL),
++	DD_ATTR(other_lat_model, adios_other_lat_model_show, NULL),
++
++	DD_ATTR(global_lat_target, adios_global_lat_target_show, adios_global_lat_target_store),
++	DD_ATTR(read_lat_target, adios_read_lat_target_show, adios_read_lat_target_store),
++	DD_ATTR(write_lat_target, adios_write_lat_target_show, adios_write_lat_target_store),
++	DD_ATTR(discard_lat_target, adios_discard_lat_target_show, adios_discard_lat_target_store),
++	DD_ATTR(other_lat_target, adios_other_lat_target_show, adios_other_lat_target_store),
++
++	DD_ATTR(read_max_batch_size, adios_read_max_batch_size_show, adios_read_max_batch_size_store),
++	DD_ATTR(write_max_batch_size, adios_write_max_batch_size_show, adios_write_max_batch_size_store),
++	DD_ATTR(discard_max_batch_size, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
++	DD_ATTR(other_max_batch_size, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
++
++	__ATTR_NULL
++};
++
 +static struct elevator_type mq_adios = {
 +	.ops = {
 +		.depth_updated		= ad_depth_updated,
@@ -761,6 +877,9 @@ index 0000000000..5f01bfa535
 +		.exit_sched		= ad_exit_sched,
 +		.init_hctx		= ad_init_hctx,
 +	},
++#ifdef CONFIG_BLK_DEBUG_FS
++#endif
++	.elevator_attrs = adios_sched_attrs,
 +	.elevator_name = "adios",
 +	.elevator_owner = THIS_MODULE,
 +};
@@ -782,7 +901,6 @@ index 0000000000..5f01bfa535
 +MODULE_AUTHOR("Masahito Suzuki");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("Adaptive Deadline I/O scheduler");
-\ No newline at end of file
 -- 
 2.34.1
 
