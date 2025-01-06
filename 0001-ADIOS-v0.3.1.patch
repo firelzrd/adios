@@ -1,13 +1,13 @@
-From 7df8dc22b0776003c01b49bb397274c6e60d608c Mon Sep 17 00:00:00 2001
+From 52f4ec2a259427b5c727a7fbb4a82a8acaf9494b Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 7 Jan 2025 02:49:28 +0900
-Subject: [PATCH] ADIOS v0.3.0
+Date: Tue, 7 Jan 2025 07:07:08 +0900
+Subject: [PATCH] ADIOS v0.3.1
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 921 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 938 insertions(+)
+ block/adios.c         | 938 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 955 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..f8ae3a4704
+index 0000000000..ba6f4bbd03
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,921 @@
+@@ -0,0 +1,938 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,7 @@ index 0000000000..f8ae3a4704
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.3.0"
++#define ADIOS_VERSION "0.3.1"
 +
 +static u64 global_latency_window = 20000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -137,6 +137,7 @@ index 0000000000..f8ae3a4704
 +#define BLOCK_SIZE_THRESHOLD 4096
 +
 +static void latency_model_input(struct latency_model *model, u64 block_size, u64 latency) {
++	guard(spinlock)(&model->lock);
 +	if (block_size > BLOCK_SIZE_THRESHOLD) {
 +		if (!model->intercept) return;
 +		model->large_sum_delay +=
@@ -200,7 +201,7 @@ index 0000000000..f8ae3a4704
 +	bool more_bq_ready;
 +	struct list_head batch_queue[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
 +	unsigned int batch_count[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
-+	u64 total_predicted_latency;
++	atomic64_t total_predicted_latency;
 +};
 +
 +struct ad_rq_data {
@@ -221,6 +222,11 @@ index 0000000000..f8ae3a4704
 +	struct rb_node **new = &(root->rb_node), *parent = NULL;
 +	struct ad_rq_data *rd = rq_data(rq);
 +
++	if (!rd) {
++		pr_err("adios_add_rq_rb_sort_list: rd is NULL\n");
++		return;
++	}
++
 +	rd->block_size = blk_rq_bytes(rq);
 +	unsigned int optype = adios_optype(rq);
 +	rd->predicted_latency =
@@ -231,6 +237,12 @@ index 0000000000..f8ae3a4704
 +	while (*new) {
 +		struct request *this = rb_entry_rq(*new);
 +		struct ad_rq_data *td = rq_data(this);
++
++		if (!td) {
++			pr_err("adios_add_rq_rb_sort_list: td is NULL\n");
++			return;
++		}
++
 +		s64 diff = td->deadline - rd->deadline;
 +
 +		parent = *new;
@@ -372,11 +384,13 @@ index 0000000000..f8ae3a4704
 +	}
 +}
 +
-+static bool adios_fill_batch_queues(struct ad_data *ad) {
++static bool adios_fill_batch_queues(struct ad_data *ad, u64 *tpl) {
 +	unsigned int count = 0;
 +	unsigned int optype_count[ADIOS_NUM_OPTYPES];
 +	memset(optype_count, 0, sizeof(optype_count));
 +	int page = (ad->bq_page + 1) % ADIOS_NUM_BQ_PAGES;
++	u64 total_predicted_latency =
++		tpl ? *tpl : atomic64_read(&ad->total_predicted_latency);
 +
 +	adios_reset_batch_queues(ad, page);
 +
@@ -387,7 +401,7 @@ index 0000000000..f8ae3a4704
 +
 +		struct ad_rq_data *rd = rq_data(rq);
 +		unsigned int optype = adios_optype(rq);
-+		u64 lat = ad->total_predicted_latency + rd->predicted_latency;
++		u64 lat = total_predicted_latency + rd->predicted_latency;
 +
 +		// Check batch size and total predicted latency
 +		if (count && (ad->batch_count[page][optype] >=
@@ -401,7 +415,7 @@ index 0000000000..f8ae3a4704
 +		// Add request to the corresponding batch queue
 +		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
 +		ad->batch_count[page][optype]++;
-+		ad->total_predicted_latency = lat;
++		atomic64_add(rd->predicted_latency, &ad->total_predicted_latency);
 +		optype_count[optype]++;
 +		count++;
 +	}
@@ -423,10 +437,11 @@ index 0000000000..f8ae3a4704
 +static struct request *ad_dispatch_from_bq(struct ad_data *ad) {
 +	struct request *rq = NULL;
 +	bool fill_tried = false;
++	u64 tpl = atomic64_read(&ad->total_predicted_latency);
 +
-+	if (!ad->more_bq_ready && ad->total_predicted_latency <
-+			global_latency_window * bq_refill_below_ratio / 100) {
-+		adios_fill_batch_queues(ad);
++	if (!ad->more_bq_ready &&
++			tpl < global_latency_window * bq_refill_below_ratio / 100) {
++		adios_fill_batch_queues(ad, &tpl);
 +		fill_tried = true;
 +	}
 +
@@ -450,7 +465,7 @@ index 0000000000..f8ae3a4704
 +		if (fill_tried)
 +			break;
 +
-+		if (adios_fill_batch_queues(ad))
++		if (adios_fill_batch_queues(ad, NULL))
 +			adios_flip_bq(ad);
 +		fill_tried = true;
 +	}
@@ -698,8 +713,10 @@ index 0000000000..f8ae3a4704
 +	rq->elv.priv[0] = NULL;
 +
 +	struct ad_rq_data *rd = kzalloc(sizeof(*rd), GFP_KERNEL);
-+	if (!rd)
++	if (!rd) {
++		pr_err("ad_prepare_request: Failed to allocate memory. rd is NULL\n");
 +		return;
++	}
 +
 +	rq->elv.priv[1] = rd;
 +}
@@ -708,7 +725,7 @@ index 0000000000..f8ae3a4704
 +	struct ad_data *ad = rq->q->elevator->elevator_data;
 +	struct ad_rq_data *rd = rq_data(rq);
 +
-+	ad->total_predicted_latency -= rd->predicted_latency;
++	atomic64_sub(rd->predicted_latency, &ad->total_predicted_latency);
 +	if (!rq->io_start_time_ns)
 +		return;
 +
