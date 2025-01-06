@@ -1,13 +1,13 @@
-From 2c6f1200bb35816de81717a292fce5bda2b16b78 Mon Sep 17 00:00:00 2001
+From a75920a8a11662caf65bb431077589da8048f157 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 6 Jan 2025 09:04:14 +0900
-Subject: [PATCH] ADIOS v0.1.3
+Date: Mon, 6 Jan 2025 15:27:36 +0900
+Subject: [PATCH] ADIOS v0.2.0
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 842 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 859 insertions(+)
+ block/adios.c         | 847 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 864 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..7ab533de2c
+index 0000000000..9c48a6f699
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,842 @@
+@@ -0,0 +1,847 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,10 @@ index 0000000000..7ab533de2c
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+static u64 global_latency_target = 20000000ULL;
++#define ADIOS_VERSION "0.2.0"
++
++static u64 global_latency_window = 16000000ULL;
++static int bq_refill_below_ratio = 15;
 +
 +enum {
 +	ADIOS_READ,
@@ -93,8 +96,7 @@ index 0000000000..7ab533de2c
 +	ADIOS_NUM_OPTYPES,
 +};
 +
-+static unsigned int adios_optype(struct request *rq)
-+{
++static unsigned int adios_optype(struct request *rq) {
 +	blk_opf_t opf = rq->cmd_flags;
 +	switch (opf & REQ_OP_MASK) {
 +	case REQ_OP_READ:
@@ -110,7 +112,7 @@ index 0000000000..7ab533de2c
 +
 +static u64 adios_latency_targets[ADIOS_NUM_OPTYPES] = {
 +	[ADIOS_READ]    =    2ULL * NSEC_PER_MSEC,
-+	[ADIOS_WRITE]   =  500ULL * NSEC_PER_MSEC,
++	[ADIOS_WRITE]   =  750ULL * NSEC_PER_MSEC,
 +	[ADIOS_DISCARD] = 5000ULL * NSEC_PER_MSEC,
 +	[ADIOS_OTHER]   =    0ULL,
 +};
@@ -134,8 +136,7 @@ index 0000000000..7ab533de2c
 +
 +#define BLOCK_SIZE_THRESHOLD 4096
 +
-+static void latency_model_input(struct latency_model *model, u64 block_size, u64 latency)
-+{
++static void latency_model_input(struct latency_model *model, u64 block_size, u64 latency) {
 +	if (block_size > BLOCK_SIZE_THRESHOLD) {
 +		if (!model->intercept) return;
 +		model->large_sum_delay +=
@@ -147,8 +148,7 @@ index 0000000000..7ab533de2c
 +	}
 +}
 +
-+static void latency_model_update(struct latency_model *model)
-+{
++static void latency_model_update(struct latency_model *model) {
 +	guard(spinlock)(&model->lock);
 +	model->intercept = model->small_count ?
 +		(u64)div_u64(model->small_sum_delay, model->small_count) : 0ULL;
@@ -156,8 +156,7 @@ index 0000000000..7ab533de2c
 +		(u64)div_u64(model->large_sum_delay, model->large_sum_block_size) : 0ULL;
 +}
 +
-+static u64 latency_model_predict(struct latency_model *model, u64 block_size)
-+{
++static u64 latency_model_predict(struct latency_model *model, u64 block_size) {
 +	guard(spinlock)(&model->lock);
 +	u64 result = model->intercept + (block_size > BLOCK_SIZE_THRESHOLD) ?
 +		model->slope * div_u64(block_size - BLOCK_SIZE_THRESHOLD, 1024) : 0UL;
@@ -177,6 +176,8 @@ index 0000000000..7ab533de2c
 +	atomic_t completed;
 +};
 +
++#define NUM_BQ_PAGES 2
++
 +/*
 + * Adios scheduler data. Requests are present on both sort_list and dispatch list.
 + */
@@ -193,9 +194,11 @@ index 0000000000..7ab533de2c
 +	struct latency_model latency_model[ADIOS_NUM_OPTYPES];
 +	struct timer_list timer;
 +
-+	struct list_head batch_queue[ADIOS_NUM_OPTYPES];
-+	unsigned int batch_count[ADIOS_NUM_OPTYPES];
-+	u64 total_predicted_latency;
++	int bq_page;
++	bool more_bq_ready;
++	struct list_head batch_queue[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
++	unsigned int batch_count[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
++	u64 total_predicted_latency[NUM_BQ_PAGES];
 +};
 +
 +struct ad_rq_data {
@@ -206,14 +209,12 @@ index 0000000000..7ab533de2c
 +	struct rb_node pos_node;
 +};
 +
-+static inline struct ad_rq_data *rq_data(struct request *rq)
-+{
++static inline struct ad_rq_data *rq_data(struct request *rq) {
 +	return (struct ad_rq_data *)rq->elv.priv[1];
 +}
 +
 +static void
-+adios_add_rq_rb_sort_list(struct ad_data *ad, struct request *rq)
-+{
++adios_add_rq_rb_sort_list(struct ad_data *ad, struct request *rq) {
 +	struct rb_root *root = &ad->sort_list;
 +	struct rb_node **new = &(root->rb_node), *parent = NULL;
 +	struct ad_rq_data *rd = rq_data(rq);
@@ -242,8 +243,7 @@ index 0000000000..7ab533de2c
 +}
 +
 +static void
-+adios_add_rq_rb_pos_list(struct ad_data *ad, struct request *rq)
-+{
++adios_add_rq_rb_pos_list(struct ad_data *ad, struct request *rq) {
 +	struct ad_rq_data *rd = rq_data(rq);
 +	sector_t pos = blk_rq_pos(rq);
 +	struct rb_root *root = &ad->pos_list;
@@ -264,30 +264,26 @@ index 0000000000..7ab533de2c
 +}
 +
 +static void
-+adios_add_rq_rb(struct ad_data *ad, struct request *rq)
-+{
++adios_add_rq_rb(struct ad_data *ad, struct request *rq) {
 +	adios_add_rq_rb_sort_list(ad, rq);
 +	adios_add_rq_rb_pos_list(ad, rq);
 +}
 +
 +static inline void
-+adios_del_rq_rb_sort_list(struct ad_data *ad, struct request *rq)
-+{
++adios_del_rq_rb_sort_list(struct ad_data *ad, struct request *rq) {
 +	rb_erase(&rq->rb_node, &ad->sort_list);
 +	RB_CLEAR_NODE(&rq->rb_node);
 +}
 +
 +static inline void
-+adios_del_rq_rb_pos_list(struct ad_data *ad, struct request *rq)
-+{
++adios_del_rq_rb_pos_list(struct ad_data *ad, struct request *rq) {
 +	struct ad_rq_data *rd = rq_data(rq);
 +	rb_erase(&rd->pos_node, &ad->pos_list);
 +	RB_CLEAR_NODE(&rd->pos_node);
 +}
 +
 +static inline void
-+adios_del_rq_rb(struct ad_data *ad, struct request *rq)
-+{
++adios_del_rq_rb(struct ad_data *ad, struct request *rq) {
 +	adios_del_rq_rb_sort_list(ad, rq);
 +	adios_del_rq_rb_pos_list(ad, rq);
 +}
@@ -295,8 +291,7 @@ index 0000000000..7ab533de2c
 +/*
 + * remove rq from rbtree and dispatch list.
 + */
-+static void adios_remove_request(struct ad_data *ad, struct request *rq)
-+{
++static void adios_remove_request(struct ad_data *ad, struct request *rq) {
 +	struct request_queue *q = rq->q;
 +
 +	list_del_init(&rq->queuelist);
@@ -313,8 +308,7 @@ index 0000000000..7ab533de2c
 +}
 +
 +static void ad_request_merged(struct request_queue *q, struct request *req,
-+				  enum elv_merge type)
-+{
++				  enum elv_merge type) {
 +	struct ad_data *ad = q->elevator->elevator_data;
 +
 +	/*
@@ -330,8 +324,7 @@ index 0000000000..7ab533de2c
 + * Callback function that is invoked after @next has been merged into @req.
 + */
 +static void ad_merged_requests(struct request_queue *q, struct request *req,
-+				   struct request *next)
-+{
++				   struct request *next) {
 +	struct ad_data *ad = q->elevator->elevator_data;
 +
 +	lockdep_assert_held(&ad->lock);
@@ -345,8 +338,7 @@ index 0000000000..7ab533de2c
 +}
 +
 +/* Number of requests queued. */
-+static u32 ad_queued(struct ad_data *ad)
-+{
++static u32 ad_queued(struct ad_data *ad) {
 +	const struct io_stats *stats = &ad->stats;
 +
 +	lockdep_assert_held(&ad->lock);
@@ -358,29 +350,26 @@ index 0000000000..7ab533de2c
 + * Return the next request to dispatch using sector position sorted lists.
 + */
 +static struct request *
-+adios_next_request(struct ad_data *ad)
-+{
++adios_next_request(struct ad_data *ad) {
 +	if (RB_EMPTY_ROOT(&ad->sort_list))
 +		return NULL;
 +
 +	return rb_entry_rq(rb_first(&ad->sort_list));
 +}
 +
-+static void adios_init_batch_queues(struct ad_data *ad)
-+{
-+	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
-+		INIT_LIST_HEAD(&ad->batch_queue[i]);
-+		ad->batch_count[i] = 0;
++static void adios_init_batch_queues(struct ad_data *ad) {
++	for (int page = 0; page < NUM_BQ_PAGES; page++) {
++		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++) {
++			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
++			ad->batch_count[page][optype] = 0;
++		}
++		ad->total_predicted_latency[page] = 0;
 +	}
-+
-+	ad->total_predicted_latency = 0;
 +}
 +
-+static bool adios_fill_batch_queues(struct ad_data *ad)
-+{
++static bool adios_fill_batch_queues(struct ad_data *ad) {
 +	unsigned int count = 0;
-+
-+	adios_init_batch_queues(ad);
++	int page = (ad->bq_page + 1) % NUM_BQ_PAGES;
 +
 +	while (true) {
 +		struct request *rq = adios_next_request(ad);
@@ -389,45 +378,68 @@ index 0000000000..7ab533de2c
 +
 +		struct ad_rq_data *rd = rq_data(rq);
 +		unsigned int optype = adios_optype(rq);
-+		u64 lat = ad->total_predicted_latency + rd->predicted_latency;
++		u64 lat = ad->total_predicted_latency[page] + rd->predicted_latency;
 +
 +		// Check batch size and total predicted latency
-+		if (count && (ad->batch_count[optype] >= adios_max_batch_size[optype] ||
-+			lat > global_latency_target)) {
++		if (count && (ad->batch_count[page][optype] >=
++				adios_max_batch_size[optype] ||
++			lat > global_latency_window)) {
 +			break;
 +		}
 +
 +		adios_remove_request(ad, rq);
 +
 +		// Add request to the corresponding batch queue
-+		list_add_tail(&rq->queuelist, &ad->batch_queue[optype]);
-+		ad->batch_count[optype]++;
-+		ad->total_predicted_latency = lat;
++		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
++		ad->batch_count[page][optype]++;
++		ad->total_predicted_latency[page] = lat;
 +		count++;
 +	}
-+
++	if (count)
++		ad->more_bq_ready = true;
 +	return count;
 +}
 +
-+static struct request *ad_dispatch_from_bq(struct ad_data *ad)
-+{
-+	struct request *rq = NULL;
-+	bool retry = false;
++static void adios_flip_bq(struct ad_data *ad) {
++	ad->more_bq_ready = false;
++	ad->bq_page = (ad->bq_page + 1) % 2;
++}
 +
-+	do {
++static struct request *ad_dispatch_from_bq(struct ad_data *ad) {
++	struct request *rq = NULL;
++	bool fill_tried = false;
++
++	if (!ad->more_bq_ready && ad->total_predicted_latency[ad->bq_page] <
++			global_latency_window * bq_refill_below_ratio / 100) {
++		if (adios_fill_batch_queues(ad))
++			adios_flip_bq(ad);
++		fill_tried = true;
++	}
++
++	while(true) {
 +		// Check if there are any requests in the batch queues
 +		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
-+			if (!list_empty(&ad->batch_queue[i])) {
-+				rq = list_first_entry(&ad->batch_queue[i], struct request, queuelist);
++			if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
++				rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
++										struct request, queuelist);
 +				list_del_init(&rq->queuelist);
 +				goto found;
 +			}
 +		}
 +
-+		// If batch queues are empty, fill them
-+		if (retry || adios_fill_batch_queues(ad))
-+			retry = !retry;
-+	} while(retry);
++		// If there's more batch queue page available, flip to it and retry
++		if (ad->more_bq_ready) {
++			adios_flip_bq(ad);
++			continue;
++		}
++
++		if (fill_tried)
++			break;
++
++		if (adios_fill_batch_queues(ad))
++			adios_flip_bq(ad);
++		fill_tried = true;
++	}
 +
 +	if (!rq)
 +		return NULL;
@@ -445,8 +457,7 @@ index 0000000000..7ab533de2c
 + * different hardware queue. This is because mq-adios has shared
 + * state for all hardware queues, in terms of sorting, FIFOs, etc.
 + */
-+static struct request *ad_dispatch_request(struct blk_mq_hw_ctx *hctx)
-+{
++static struct request *ad_dispatch_request(struct blk_mq_hw_ctx *hctx) {
 +	struct ad_data *ad = hctx->queue->elevator->elevator_data;
 +	struct request *rq;
 +
@@ -462,8 +473,7 @@ index 0000000000..7ab533de2c
 + * 1..(1 << bt->sb.shift) is the range expected by sbitmap_get_shallow().
 + * Values larger than q->nr_requests have the same effect as q->nr_requests.
 + */
-+static int ad_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth)
-+{
++static int ad_to_word_depth(struct blk_mq_hw_ctx *hctx, unsigned int qdepth) {
 +	struct sbitmap_queue *bt = &hctx->sched_tags->bitmap_tags;
 +	const unsigned int nrr = hctx->queue->nr_requests;
 +
@@ -474,8 +484,7 @@ index 0000000000..7ab533de2c
 + * Called by __blk_mq_alloc_request(). The shallow_depth value set by this
 + * function is used by __blk_mq_get_tag().
 + */
-+static void ad_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
-+{
++static void ad_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data) {
 +	struct ad_data *ad = data->q->elevator->elevator_data;
 +
 +	/* Do not throttle synchronous reads. */
@@ -490,8 +499,7 @@ index 0000000000..7ab533de2c
 +}
 +
 +/* Called by blk_mq_update_nr_requests(). */
-+static void ad_depth_updated(struct blk_mq_hw_ctx *hctx)
-+{
++static void ad_depth_updated(struct blk_mq_hw_ctx *hctx) {
 +	struct request_queue *q = hctx->queue;
 +	struct ad_data *ad = q->elevator->elevator_data;
 +	struct blk_mq_tags *tags = hctx->sched_tags;
@@ -502,14 +510,12 @@ index 0000000000..7ab533de2c
 +}
 +
 +/* Called by blk_mq_init_hctx() and blk_mq_init_sched(). */
-+static int ad_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
-+{
++static int ad_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
 +	ad_depth_updated(hctx);
 +	return 0;
 +}
 +
-+static void ad_exit_sched(struct elevator_queue *e)
-+{
++static void ad_exit_sched(struct elevator_queue *e) {
 +	struct ad_data *ad = e->elevator_data;
 +
 +	timer_shutdown_sync(&ad->timer);
@@ -528,8 +534,7 @@ index 0000000000..7ab533de2c
 +	kfree(ad);
 +}
 +
-+static void adios_timer_fn(struct timer_list *t)
-+{
++static void adios_timer_fn(struct timer_list *t) {
 +	struct ad_data *ad = from_timer(ad, t, timer);
 +	unsigned int optype;
 +
@@ -540,8 +545,7 @@ index 0000000000..7ab533de2c
 +/*
 + * initialize elevator private data (adios_data).
 + */
-+static int ad_init_sched(struct request_queue *q, struct elevator_type *e)
-+{
++static int ad_init_sched(struct request_queue *q, struct elevator_type *e) {
 +	struct ad_data *ad;
 +	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
@@ -583,8 +587,7 @@ index 0000000000..7ab533de2c
 + * an existing request, store the pointer to that request into *@rq.
 + */
 +static int ad_request_merge(struct request_queue *q, struct request **rq,
-+				struct bio *bio)
-+{
++				struct bio *bio) {
 +	struct ad_data *ad = q->elevator->elevator_data;
 +	sector_t sector = bio_end_sector(bio);
 +	struct request *__rq;
@@ -609,8 +612,7 @@ index 0000000000..7ab533de2c
 + * before @bio is associated with a request.
 + */
 +static bool ad_bio_merge(struct request_queue *q, struct bio *bio,
-+		unsigned int nr_segs)
-+{
++		unsigned int nr_segs) {
 +	struct ad_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
 +	bool ret;
@@ -629,8 +631,7 @@ index 0000000000..7ab533de2c
 + * add rq to rbtree and dispatch list
 + */
 +static void ad_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
-+				  blk_insert_t flags, struct list_head *free)
-+{
++				  blk_insert_t flags, struct list_head *free) {
 +	struct request_queue *q = hctx->queue;
 +	struct ad_data *ad = q->elevator->elevator_data;
 +
@@ -660,8 +661,7 @@ index 0000000000..7ab533de2c
 + */
 +static void ad_insert_requests(struct blk_mq_hw_ctx *hctx,
 +				   struct list_head *list,
-+				   blk_insert_t flags)
-+{
++				   blk_insert_t flags) {
 +	struct request_queue *q = hctx->queue;
 +	struct ad_data *ad = q->elevator->elevator_data;
 +	LIST_HEAD(free);
@@ -680,8 +680,7 @@ index 0000000000..7ab533de2c
 +}
 +
 +/* Callback from inside blk_mq_rq_ctx_init(). */
-+static void ad_prepare_request(struct request *rq)
-+{
++static void ad_prepare_request(struct request *rq) {
 +	rq->elv.priv[0] = NULL;
 +
 +	struct ad_rq_data *rd = kzalloc(sizeof(*rd), GFP_KERNEL);
@@ -691,12 +690,11 @@ index 0000000000..7ab533de2c
 +	rq->elv.priv[1] = rd;
 +}
 +
-+static void ad_completed_request(struct request *rq, u64 now)
-+{
++static void ad_completed_request(struct request *rq, u64 now) {
 +	struct ad_data *ad = rq->q->elevator->elevator_data;
 +	struct ad_rq_data *rd = rq_data(rq);
 +
-+	ad->total_predicted_latency -= rd->predicted_latency;
++	ad->total_predicted_latency[ad->bq_page] -= rd->predicted_latency;
 +	if (!rq->io_start_time_ns)
 +		return;
 +
@@ -709,8 +707,7 @@ index 0000000000..7ab533de2c
 +/*
 + * Callback from inside blk_mq_free_request().
 + */
-+static void ad_finish_request(struct request *rq)
-+{
++static void ad_finish_request(struct request *rq) {
 +	struct ad_data *ad = rq->q->elevator->elevator_data;
 +
 +	/*
@@ -725,26 +722,24 @@ index 0000000000..7ab533de2c
 +	}
 +}
 +
-+static bool ad_has_work_for_ad(struct ad_data *ad)
-+{
-+	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
-+		if(!list_empty_careful(&ad->batch_queue[i]))
-+			return true;
++static bool ad_has_work_for_ad(struct ad_data *ad) {
++	for (int page = 0; page < NUM_BQ_PAGES; page++)
++		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
++			if(!list_empty_careful(&ad->batch_queue[page][i]))
++				return true;
 +
 +	return !list_empty_careful(&ad->dispatch) ||
 +		!RB_EMPTY_ROOT(&ad->sort_list);
 +}
 +
-+static bool ad_has_work(struct blk_mq_hw_ctx *hctx)
-+{
++static bool ad_has_work(struct blk_mq_hw_ctx *hctx) {
 +	struct ad_data *ad = hctx->queue->elevator->elevator_data;
 +
 +	return ad_has_work_for_ad(ad);
 +}
 +
-+#define SHOW_LATENCY_MODEL(name, optype)					\
-+static ssize_t adios_##name##_lat_model_show(struct elevator_queue *e, char *page) \
-+{									\
++#define SYSFS_OPTYPE_DECL(name, optype)					\
++static ssize_t adios_##name##_lat_model_show(struct elevator_queue *e, char *page) { \
 +	struct ad_data *ad = e->elevator_data;				\
 +	struct latency_model *model = &ad->latency_model[optype];		\
 +	ssize_t len = 0;						\
@@ -756,16 +751,9 @@ index 0000000000..7ab533de2c
 +	len += sprintf(page + len, "large_sum_delay: %llu\n", model->large_sum_delay);\
 +	len += sprintf(page + len, "large_sum_block_size: %llu\n", model->large_sum_block_size);\
 +	return len;							\
-+}
-+
-+SHOW_LATENCY_MODEL(read, ADIOS_READ);
-+SHOW_LATENCY_MODEL(write, ADIOS_WRITE);
-+SHOW_LATENCY_MODEL(discard, ADIOS_DISCARD);
-+SHOW_LATENCY_MODEL(other, ADIOS_OTHER);
-+
-+#define STORE_LATENCY_TARGET(name, optype)					\
-+static ssize_t adios_##name##_lat_target_store(struct elevator_queue *e, const char *page, size_t count) \
-+{										\
++} \
++static ssize_t adios_##name##_lat_target_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
 +	struct ad_data *ad = e->elevator_data;						\
 +	unsigned long nsec;								\
 +	int ret;									\
@@ -779,19 +767,12 @@ index 0000000000..7ab533de2c
 +											\
 +	return count;									\
 +}										\
-+static ssize_t adios_##name##_lat_target_show(struct elevator_queue *e, char *page) \
-+{										\
++static ssize_t adios_##name##_lat_target_show( \
++		struct elevator_queue *e, char *page) { \
 +	return sprintf(page, "%llu\n", adios_latency_targets[optype]);			\
-+}
-+
-+STORE_LATENCY_TARGET(read, ADIOS_READ);
-+STORE_LATENCY_TARGET(write, ADIOS_WRITE);
-+STORE_LATENCY_TARGET(discard, ADIOS_DISCARD);
-+STORE_LATENCY_TARGET(other, ADIOS_OTHER);
-+
-+#define STORE_MAX_BATCH_SIZE(name, optype)					\
-+static ssize_t adios_##name##_max_batch_size_store(struct elevator_queue *e, const char *page, size_t count) \
-+{										\
++} \
++static ssize_t adios_##name##_max_batch_size_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
 +	unsigned long max_batch;							\
 +	int ret;									\
 +											\
@@ -803,56 +784,81 @@ index 0000000000..7ab533de2c
 +											\
 +	return count;									\
 +}										\
-+static ssize_t adios_##name##_max_batch_size_show(struct elevator_queue *e, char *page) \
-+{										\
++static ssize_t adios_##name##_max_batch_size_show( \
++		struct elevator_queue *e, char *page) { \
 +	return sprintf(page, "%u\n", adios_max_batch_size[optype]);				\
 +}
 +
-+STORE_MAX_BATCH_SIZE(read, ADIOS_READ);
-+STORE_MAX_BATCH_SIZE(write, ADIOS_WRITE);
-+STORE_MAX_BATCH_SIZE(discard, ADIOS_DISCARD);
-+STORE_MAX_BATCH_SIZE(other, ADIOS_OTHER);
++SYSFS_OPTYPE_DECL(read, ADIOS_READ);
++SYSFS_OPTYPE_DECL(write, ADIOS_WRITE);
++SYSFS_OPTYPE_DECL(discard, ADIOS_DISCARD);
++SYSFS_OPTYPE_DECL(other, ADIOS_OTHER);
 +
-+#define STORE_GLOBAL_LATENCY_TARGET(name)					\
-+static ssize_t adios_##name##_store(struct elevator_queue *e, const char *page, size_t count) \
-+{										\
-+	unsigned long nsec;								\
-+	int ret;									\
-+											\
-+	ret = kstrtoul(page, 10, &nsec);							\
-+	if (ret)									\
-+		return ret;									\
-+											\
-+	global_latency_target = nsec;							\
-+											\
-+	return count;									\
-+}										\
-+static ssize_t adios_##name##_show(struct elevator_queue *e, char *page) \
-+{										\
-+	return sprintf(page, "%llu\n", global_latency_target);				\
++static ssize_t adios_global_latency_window_store(struct elevator_queue *e, const char *page, size_t count)
++{
++	unsigned long nsec;
++	int ret;
++
++	ret = kstrtoul(page, 10, &nsec);
++	if (ret)
++		return ret;
++
++	global_latency_window = nsec;
++
++	return count;
 +}
 +
-+STORE_GLOBAL_LATENCY_TARGET(global_lat_target);
++static ssize_t adios_global_latency_window_show(struct elevator_queue *e, char *page)
++{
++	return sprintf(page, "%llu\n", global_latency_window);
++}
 +
 +#define DD_ATTR(name, show_func, store_func) \
 +	__ATTR(name, 0644, show_func, store_func)
 +
++static ssize_t adios_bq_refill_below_ratio_show(
++		struct elevator_queue *e, char *page) {
++	return sprintf(page, "%d\n", bq_refill_below_ratio);
++}
++
++static ssize_t adios_bq_refill_below_ratio_store(
++		struct elevator_queue *e, const char *page, size_t count) {
++	int ratio;
++	int ret;
++
++	ret = kstrtoint(page, 10, &ratio);
++	if (ret || ratio < 0 || ratio > 100)
++		return -EINVAL;
++
++	bq_refill_below_ratio = ratio;
++	return count;
++}
++
++static ssize_t adios_version_show(struct elevator_queue *e, char *page)
++{
++    return sprintf(page, "%s\n", ADIOS_VERSION);
++}
++
 +static struct elv_fs_entry adios_sched_attrs[] = {
-+	DD_ATTR(read_lat_model, adios_read_lat_model_show, NULL),
-+	DD_ATTR(write_lat_model, adios_write_lat_model_show, NULL),
-+	DD_ATTR(discard_lat_model, adios_discard_lat_model_show, NULL),
-+	DD_ATTR(other_lat_model, adios_other_lat_model_show, NULL),
++	DD_ATTR(lat_model_read, adios_read_lat_model_show, NULL),
++	DD_ATTR(lat_model_write, adios_write_lat_model_show, NULL),
++	DD_ATTR(lat_model_discard, adios_discard_lat_model_show, NULL),
++	DD_ATTR(lat_model_other, adios_other_lat_model_show, NULL),
 +
-+	DD_ATTR(global_lat_target, adios_global_lat_target_show, adios_global_lat_target_store),
-+	DD_ATTR(read_lat_target, adios_read_lat_target_show, adios_read_lat_target_store),
-+	DD_ATTR(write_lat_target, adios_write_lat_target_show, adios_write_lat_target_store),
-+	DD_ATTR(discard_lat_target, adios_discard_lat_target_show, adios_discard_lat_target_store),
-+	DD_ATTR(other_lat_target, adios_other_lat_target_show, adios_other_lat_target_store),
++	DD_ATTR(lat_target_read, adios_read_lat_target_show, adios_read_lat_target_store),
++	DD_ATTR(lat_target_write, adios_write_lat_target_show, adios_write_lat_target_store),
++	DD_ATTR(lat_target_discard, adios_discard_lat_target_show, adios_discard_lat_target_store),
++	DD_ATTR(lat_target_other, adios_other_lat_target_show, adios_other_lat_target_store),
 +
-+	DD_ATTR(read_max_batch_size, adios_read_max_batch_size_show, adios_read_max_batch_size_store),
-+	DD_ATTR(write_max_batch_size, adios_write_max_batch_size_show, adios_write_max_batch_size_store),
-+	DD_ATTR(discard_max_batch_size, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
-+	DD_ATTR(other_max_batch_size, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
++	DD_ATTR(max_batch_size_read, adios_read_max_batch_size_show, adios_read_max_batch_size_store),
++	DD_ATTR(max_batch_size_write, adios_write_max_batch_size_show, adios_write_max_batch_size_store),
++	DD_ATTR(max_batch_size_discard, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
++	DD_ATTR(max_batch_size_other, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
++
++	DD_ATTR(global_latency_window, adios_global_latency_window_show, adios_global_latency_window_store),
++	DD_ATTR(bq_refill_below_ratio, adios_bq_refill_below_ratio_show, adios_bq_refill_below_ratio_store),
++
++	DD_ATTR(adios_version, adios_version_show, NULL),
 +
 +	__ATTR_NULL
 +};
@@ -868,14 +874,14 @@ index 0000000000..7ab533de2c
 +		.finish_request		= ad_finish_request,
 +		.next_request		= elv_rb_latter_request,
 +		.former_request		= elv_rb_former_request,
-+		.bio_merge		= ad_bio_merge,
++		.bio_merge			= ad_bio_merge,
 +		.request_merge		= ad_request_merge,
 +		.requests_merged	= ad_merged_requests,
 +		.request_merged		= ad_request_merged,
-+		.has_work		= ad_has_work,
-+		.init_sched		= ad_init_sched,
-+		.exit_sched		= ad_exit_sched,
-+		.init_hctx		= ad_init_hctx,
++		.has_work			= ad_has_work,
++		.init_sched			= ad_init_sched,
++		.exit_sched			= ad_exit_sched,
++		.init_hctx			= ad_init_hctx,
 +	},
 +#ifdef CONFIG_BLK_DEBUG_FS
 +#endif
@@ -885,13 +891,12 @@ index 0000000000..7ab533de2c
 +};
 +MODULE_ALIAS("mq-adios-iosched");
 +
-+static int __init adios_init(void)
-+{
++static int __init adios_init(void) {
++	printk(KERN_INFO "Adaptive Deadline I/O Scheduler %s by Masahito Suzuki", ADIOS_VERSION);
 +	return elv_register(&mq_adios);
 +}
 +
-+static void __exit adios_exit(void)
-+{
++static void __exit adios_exit(void) {
 +	elv_unregister(&mq_adios);
 +}
 +
