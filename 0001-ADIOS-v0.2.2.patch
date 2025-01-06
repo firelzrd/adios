@@ -1,7 +1,7 @@
-From bd119ae7c597455735917f0229955dc2ca77cc5f Mon Sep 17 00:00:00 2001
+From af98d086f993ebabaa2caa16c7cdbda9c5fbfc86 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 6 Jan 2025 16:20:59 +0900
-Subject: [PATCH] ADIOS v0.2.1
+Date: Mon, 6 Jan 2025 17:11:04 +0900
+Subject: [PATCH] ADIOS v0.2.2
 
 ---
  block/Kconfig.iosched |   9 +
@@ -55,7 +55,7 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..09eaaab81b
+index 0000000000..4dcaef1c8d
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,846 @@
@@ -83,9 +83,9 @@ index 0000000000..09eaaab81b
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.2.1"
++#define ADIOS_VERSION "0.2.2"
 +
-+static u64 global_latency_window = 16000000ULL;
++static u64 global_latency_window = 20000000ULL;
 +static int bq_refill_below_ratio = 15;
 +
 +enum {
@@ -198,7 +198,7 @@ index 0000000000..09eaaab81b
 +	bool more_bq_ready;
 +	struct list_head batch_queue[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
 +	unsigned int batch_count[NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
-+	u64 total_predicted_latency[NUM_BQ_PAGES];
++	u64 total_predicted_latency;
 +};
 +
 +struct ad_rq_data {
@@ -363,7 +363,7 @@ index 0000000000..09eaaab81b
 +			INIT_LIST_HEAD(&ad->batch_queue[page][optype]);
 +			ad->batch_count[page][optype] = 0;
 +		}
-+		ad->total_predicted_latency[page] = 0;
++		ad->total_predicted_latency = 0;
 +	}
 +}
 +
@@ -378,7 +378,7 @@ index 0000000000..09eaaab81b
 +
 +		struct ad_rq_data *rd = rq_data(rq);
 +		unsigned int optype = adios_optype(rq);
-+		u64 lat = ad->total_predicted_latency[page] + rd->predicted_latency;
++		u64 lat = ad->total_predicted_latency + rd->predicted_latency;
 +
 +		// Check batch size and total predicted latency
 +		if (count && (ad->batch_count[page][optype] >=
@@ -392,7 +392,7 @@ index 0000000000..09eaaab81b
 +		// Add request to the corresponding batch queue
 +		list_add_tail(&rq->queuelist, &ad->batch_queue[page][optype]);
 +		ad->batch_count[page][optype]++;
-+		ad->total_predicted_latency[page] = lat;
++		ad->total_predicted_latency = lat;
 +		count++;
 +	}
 +	if (count)
@@ -409,7 +409,7 @@ index 0000000000..09eaaab81b
 +	struct request *rq = NULL;
 +	bool fill_tried = false;
 +
-+	if (!ad->more_bq_ready && ad->total_predicted_latency[ad->bq_page] <
++	if (!ad->more_bq_ready && ad->total_predicted_latency <
 +			global_latency_window * bq_refill_below_ratio / 100) {
 +		adios_fill_batch_queues(ad);
 +		fill_tried = true;
@@ -693,7 +693,7 @@ index 0000000000..09eaaab81b
 +	struct ad_data *ad = rq->q->elevator->elevator_data;
 +	struct ad_rq_data *rd = rq_data(rq);
 +
-+	ad->total_predicted_latency[ad->bq_page] -= rd->predicted_latency;
++	ad->total_predicted_latency -= rd->predicted_latency;
 +	if (!rq->io_start_time_ns)
 +		return;
 +
