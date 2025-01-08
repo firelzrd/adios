@@ -1,13 +1,13 @@
-From 04ffa5dea8cca885c4dc0a4478e9b5e5ad18f917 Mon Sep 17 00:00:00 2001
+From 227d90e02d5a68ac2ea0165bd4cb4a699a10ffa2 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 8 Jan 2025 05:39:34 +0900
-Subject: [PATCH] ADIOS v0.4.0
+Date: Wed, 8 Jan 2025 17:03:40 +0900
+Subject: [PATCH] ADIOS v0.5.0
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 942 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 959 insertions(+)
+ block/adios.c         | 998 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1015 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..02f58a4dec
+index 0000000000..4852894ac9
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,942 @@
+@@ -0,0 +1,998 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,7 @@ index 0000000000..02f58a4dec
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.4.0"
++#define ADIOS_VERSION "0.5.0"
 +
 +static u64 global_latency_window = 16000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -137,9 +137,13 @@ index 0000000000..02f58a4dec
 +#define BLOCK_SIZE_THRESHOLD 4096
 +
 +static void latency_model_input(struct latency_model *model, u64 block_size, u64 latency) {
-+	guard(spinlock)(&model->lock);
++	unsigned long flags;
++	spin_lock_irqsave(&model->lock, flags);
 +	if (block_size > BLOCK_SIZE_THRESHOLD) {
-+		if (!model->intercept) return;
++		if (!model->intercept) {
++			spin_unlock_irqrestore(&model->lock, flags);
++			return;
++		}
 +		model->large_sum_delay +=
 +			(latency > model->intercept) ? latency - model->intercept : 0ULL;
 +		model->large_sum_block_size += (block_size - BLOCK_SIZE_THRESHOLD) >> 10;
@@ -147,21 +151,27 @@ index 0000000000..02f58a4dec
 +		model->small_sum_delay += latency;
 +		model->small_count++;
 +	}
++	spin_unlock_irqrestore(&model->lock, flags);
 +}
 +
 +static void latency_model_update(struct latency_model *model) {
-+	guard(spinlock)(&model->lock);
++	unsigned long flags;
++	spin_lock_irqsave(&model->lock, flags);
 +	model->intercept = model->small_count ?
 +		(u64)div_u64(model->small_sum_delay, model->small_count) : 0ULL;
 +	model->slope = model->large_sum_block_size ?
 +		(u64)div_u64(model->large_sum_delay, model->large_sum_block_size) : 0ULL;
++	spin_unlock_irqrestore(&model->lock, flags);
 +}
 +
 +static u64 latency_model_predict(struct latency_model *model, u64 block_size) {
-+	guard(spinlock)(&model->lock);
-+	u64 result = model->intercept;
-+	if (block_size > BLOCK_SIZE_THRESHOLD)
-+		result += model->slope * (block_size - BLOCK_SIZE_THRESHOLD) >> 10;
++	unsigned long flags;
++	u64 result;
++
++	spin_lock_irqsave(&model->lock, flags);
++	result = model->intercept + (block_size > BLOCK_SIZE_THRESHOLD) ?
++		model->slope * div_u64(block_size - BLOCK_SIZE_THRESHOLD, 1024) : 0UL;
++	spin_unlock_irqrestore(&model->lock, flags);
 +
 +	return result;
 +}
@@ -203,6 +213,9 @@ index 0000000000..02f58a4dec
 +	struct list_head batch_queue[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
 +	unsigned int batch_count[ADIOS_NUM_BQ_PAGES][ADIOS_NUM_OPTYPES];
 +	atomic64_t total_predicted_latency;
++
++	/* Pre-allocated memory pool for ad_rq_data */
++	struct kmem_cache *ad_rq_data_pool;
 +};
 +
 +struct ad_rq_data {
@@ -560,6 +573,10 @@ index 0000000000..02f58a4dec
 +		  ad->stats.inserted, ad->stats.merged,
 +		  ad->stats.dispatched, atomic_read(&ad->stats.completed));
 +
++	/* Free the memory pool */
++	if (ad->ad_rq_data_pool)
++		kmem_cache_destroy(ad->ad_rq_data_pool);
++
 +	kfree(ad);
 +}
 +
@@ -578,6 +595,7 @@ index 0000000000..02f58a4dec
 +	struct ad_data *ad;
 +	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
++	unsigned int max_rq_data;
 +
 +	eq = elevator_alloc(q, e);
 +	if (!eq)
@@ -586,6 +604,32 @@ index 0000000000..02f58a4dec
 +	ad = kzalloc_node(sizeof(*ad), GFP_KERNEL, q->node);
 +	if (!ad)
 +		goto put_eq;
++
++	/* Calculate the maximum number of ad_rq_data needed */
++	max_rq_data = 0;
++	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
++		max_rq_data += adios_max_batch_size[i];
++	}
++	max_rq_data *= 2; /* Double buffering */
++
++	/* Create a memory pool for ad_rq_data */
++	ad->ad_rq_data_pool = kmem_cache_create("ad_rq_data_pool",
++						sizeof(struct ad_rq_data),
++						0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!ad->ad_rq_data_pool) {
++		pr_err("adios: Failed to create ad_rq_data_pool\n");
++		goto free_ad;
++	}
++
++	/* Pre-allocate memory in the pool */
++	for (int i = 0; i < max_rq_data; i++) {
++		struct ad_rq_data *rd = kmem_cache_alloc(ad->ad_rq_data_pool, GFP_KERNEL);
++		if (!rd) {
++			pr_err("adios: Failed to pre-allocate memory in ad_rq_data_pool\n");
++			goto destroy_pool;
++		}
++		kmem_cache_free(ad->ad_rq_data_pool, rd);
++	}
 +
 +	eq->elevator_data = ad;
 +
@@ -606,6 +650,10 @@ index 0000000000..02f58a4dec
 +	q->elevator = eq;
 +	return 0;
 +
++destroy_pool:
++	kmem_cache_destroy(ad->ad_rq_data_pool);
++free_ad:
++	kfree(ad);
 +put_eq:
 +	kobject_put(&eq->kobj);
 +	return ret;
@@ -669,13 +717,6 @@ index 0000000000..02f58a4dec
 +	if (!rq->elv.priv[0]) {
 +		ad->stats.inserted++;
 +		rq->elv.priv[0] = (void *)(uintptr_t)1;
-+
-+		struct ad_rq_data *rd = kzalloc(sizeof(*rd), GFP_KERNEL);
-+		if (!rd) {
-+			pr_err("ad_insert_request: Failed to allocate memory. rd is NULL\n");
-+			return;
-+		}
-+		rq->elv.priv[1] = rd;
 +	}
 +
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
@@ -717,7 +758,20 @@ index 0000000000..02f58a4dec
 +
 +/* Callback from inside blk_mq_rq_ctx_init(). */
 +static void ad_prepare_request(struct request *rq) {
++	struct ad_data *ad = rq->q->elevator->elevator_data;
++	struct ad_rq_data *rd;
++
 +	rq->elv.priv[0] = NULL;
++	rq->elv.priv[1] = NULL;
++
++	/* Allocate ad_rq_data from the memory pool */
++	rd = kmem_cache_alloc(ad->ad_rq_data_pool, GFP_ATOMIC);
++	if (!rd) {
++		pr_err("ad_prepare_request: Failed to allocate memory from ad_rq_data_pool. rd is NULL\n");
++		return;
++	}
++
++	rq->elv.priv[1] = rd;
 +}
 +
 +static void ad_completed_request(struct request *rq, u64 now) {
@@ -745,13 +799,12 @@ index 0000000000..02f58a4dec
 +	 * called ad_insert_requests(). Skip requests that bypassed I/O
 +	 * scheduling. See also blk_mq_request_bypass_insert().
 +	 */
++	if (rq->elv.priv[1]) {
++		/* Free ad_rq_data back to the memory pool */
++		kmem_cache_free(ad->ad_rq_data_pool, rq_data(rq));
++		rq->elv.priv[1] = NULL;
++	}
 +	if (rq->elv.priv[0]) {
-+	
-+		if (rq->elv.priv[1]) {
-+			kfree(rq->elv.priv[1]);
-+			rq->elv.priv[1] = NULL;
-+		}
-+	
 +		rq->elv.priv[0] = NULL;
 +		atomic_inc(&ad->stats.completed);
 +	}
@@ -759,8 +812,8 @@ index 0000000000..02f58a4dec
 +
 +static bool ad_has_work_for_ad(struct ad_data *ad) {
 +	for (int page = 0; page < ADIOS_NUM_BQ_PAGES; page++)
-+		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
-+			if(!list_empty_careful(&ad->batch_queue[page][i]))
++		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++)
++			if(!list_empty_careful(&ad->batch_queue[page][optype]))
 +				return true;
 +
 +	return !list_empty_careful(&ad->dispatch) ||
@@ -778,13 +831,15 @@ index 0000000000..02f58a4dec
 +	struct ad_data *ad = e->elevator_data;				\
 +	struct latency_model *model = &ad->latency_model[optype];		\
 +	ssize_t len = 0;						\
-+	guard(spinlock)(&model->lock);					\
++	unsigned long flags; \
++	spin_lock_irqsave(&model->lock, flags); \
 +	len += sprintf(page, "intercept: %llu\n", model->intercept);	\
 +	len += sprintf(page + len, "slope: %llu\n", model->slope);	\
 +	len += sprintf(page + len, "small_sum_delay: %llu\n", model->small_sum_delay);\
 +	len += sprintf(page + len, "small_count: %llu\n", model->small_count);\
 +	len += sprintf(page + len, "large_sum_delay: %llu\n", model->large_sum_delay);\
 +	len += sprintf(page + len, "large_sum_block_size: %llu\n", model->large_sum_block_size);\
++	spin_unlock_irqrestore(&model->lock, flags); \
 +	return len;							\
 +} \
 +static ssize_t adios_##name##_lat_target_store( \
@@ -872,14 +927,15 @@ index 0000000000..02f58a4dec
 +	guard(spinlock)(&ad->lock);
 +	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
 +		struct latency_model *model = &ad->latency_model[i];
-+		spin_lock(&model->lock);
++		unsigned long flags;
++		spin_lock_irqsave(&model->lock, flags);
 +		model->intercept = 0ULL;
 +		model->slope = 0ULL;
 +		model->small_sum_delay = 0ULL;
 +		model->small_count = 0ULL;
 +		model->large_sum_delay = 0ULL;
 +		model->large_sum_block_size = 0ULL;
-+		spin_unlock(&model->lock);
++		spin_unlock_irqrestore(&model->lock, flags);
 +	}
 +
 +	return count;
@@ -987,7 +1043,7 @@ index 0000000000..02f58a4dec
 +MODULE_ALIAS("mq-adios-iosched");
 +
 +static int __init adios_init(void) {
-+	printk(KERN_INFO "Adaptive Deadline I/O Scheduler %s by Masahito Suzuki", ADIOS_VERSION);
++	printk(KERN_INFO "Adaptive Deadline I/O Scheduler %s by Masahito Suzuki\n", ADIOS_VERSION);
 +	return elv_register(&mq_adios);
 +}
 +
@@ -1001,6 +1057,7 @@ index 0000000000..02f58a4dec
 +MODULE_AUTHOR("Masahito Suzuki");
 +MODULE_LICENSE("GPL");
 +MODULE_DESCRIPTION("Adaptive Deadline I/O scheduler");
+\ No newline at end of file
 -- 
 2.34.1
 
