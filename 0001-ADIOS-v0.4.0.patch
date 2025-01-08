@@ -1,13 +1,13 @@
-From ba75d16890d0b68ca1eb314cc716e7fcaba3520b Mon Sep 17 00:00:00 2001
+From 04ffa5dea8cca885c4dc0a4478e9b5e5ad18f917 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 7 Jan 2025 07:45:58 +0900
-Subject: [PATCH] ADIOS v0.3.2
+Date: Wed, 8 Jan 2025 05:39:34 +0900
+Subject: [PATCH] ADIOS v0.4.0
 
 ---
  block/Kconfig.iosched |   9 +
  block/Makefile        |   8 +
- block/adios.c         | 937 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 954 insertions(+)
+ block/adios.c         | 942 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 959 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..2bc4f896de
+index 0000000000..02f58a4dec
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,937 @@
+@@ -0,0 +1,942 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,9 +83,9 @@ index 0000000000..2bc4f896de
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.3.2"
++#define ADIOS_VERSION "0.4.0"
 +
-+static u64 global_latency_window = 20000000ULL;
++static u64 global_latency_window = 16000000ULL;
 +static int bq_refill_below_ratio = 15;
 +
 +enum {
@@ -118,8 +118,8 @@ index 0000000000..2bc4f896de
 +};
 +
 +static unsigned int adios_max_batch_size[ADIOS_NUM_OPTYPES] = {
-+	[ADIOS_READ]    = 16,
-+	[ADIOS_WRITE]   =  8,
++	[ADIOS_READ]    = 64,
++	[ADIOS_WRITE]   = 32,
 +	[ADIOS_DISCARD] =  1,
 +	[ADIOS_OTHER]   =  1,
 +};
@@ -159,8 +159,9 @@ index 0000000000..2bc4f896de
 +
 +static u64 latency_model_predict(struct latency_model *model, u64 block_size) {
 +	guard(spinlock)(&model->lock);
-+	u64 result = model->intercept + (block_size > BLOCK_SIZE_THRESHOLD) ?
-+		model->slope * div_u64(block_size - BLOCK_SIZE_THRESHOLD, 1024) : 0UL;
++	u64 result = model->intercept;
++	if (block_size > BLOCK_SIZE_THRESHOLD)
++		result += model->slope * (block_size - BLOCK_SIZE_THRESHOLD) >> 10;
 +
 +	return result;
 +}
@@ -389,8 +390,7 @@ index 0000000000..2bc4f896de
 +	unsigned int optype_count[ADIOS_NUM_OPTYPES];
 +	memset(optype_count, 0, sizeof(optype_count));
 +	int page = (ad->bq_page + 1) % ADIOS_NUM_BQ_PAGES;
-+	u64 total_predicted_latency =
-+		tpl ? *tpl : atomic64_read(&ad->total_predicted_latency);
++	u64 lat = tpl ? *tpl : atomic64_read(&ad->total_predicted_latency);
 +
 +	adios_reset_batch_queues(ad, page);
 +
@@ -401,7 +401,7 @@ index 0000000000..2bc4f896de
 +
 +		struct ad_rq_data *rd = rq_data(rq);
 +		unsigned int optype = adios_optype(rq);
-+		u64 lat = total_predicted_latency + rd->predicted_latency;
++		lat += rd->predicted_latency;
 +
 +		// Check batch size and total predicted latency
 +		if (count && (ad->batch_count[page][optype] >=
@@ -669,6 +669,13 @@ index 0000000000..2bc4f896de
 +	if (!rq->elv.priv[0]) {
 +		ad->stats.inserted++;
 +		rq->elv.priv[0] = (void *)(uintptr_t)1;
++
++		struct ad_rq_data *rd = kzalloc(sizeof(*rd), GFP_KERNEL);
++		if (!rd) {
++			pr_err("ad_insert_request: Failed to allocate memory. rd is NULL\n");
++			return;
++		}
++		rq->elv.priv[1] = rd;
 +	}
 +
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
@@ -703,21 +710,14 @@ index 0000000000..2bc4f896de
 +		list_del_init(&rq->queuelist);
 +		ad_insert_request(hctx, rq, flags, &free);
 +	}
-+	blk_mq_free_requests(&free);
 +	spin_unlock(&ad->lock);
++
++	blk_mq_free_requests(&free);
 +}
 +
 +/* Callback from inside blk_mq_rq_ctx_init(). */
 +static void ad_prepare_request(struct request *rq) {
 +	rq->elv.priv[0] = NULL;
-+
-+	struct ad_rq_data *rd = kzalloc(sizeof(*rd), GFP_KERNEL);
-+	if (!rd) {
-+		pr_err("ad_prepare_request: Failed to allocate memory. rd is NULL\n");
-+		return;
-+	}
-+
-+	rq->elv.priv[1] = rd;
 +}
 +
 +static void ad_completed_request(struct request *rq, u64 now) {
@@ -746,7 +746,12 @@ index 0000000000..2bc4f896de
 +	 * scheduling. See also blk_mq_request_bypass_insert().
 +	 */
 +	if (rq->elv.priv[0]) {
-+		kfree(rq_data(rq));
++	
++		if (rq->elv.priv[1]) {
++			kfree(rq->elv.priv[1]);
++			rq->elv.priv[1] = NULL;
++		}
++	
 +		rq->elv.priv[0] = NULL;
 +		atomic_inc(&ad->stats.completed);
 +	}
