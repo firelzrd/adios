@@ -1,13 +1,13 @@
-From 227d90e02d5a68ac2ea0165bd4cb4a699a10ffa2 Mon Sep 17 00:00:00 2001
+From b418695707d6c89f7b18f7df658205c1dfc86a64 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 8 Jan 2025 17:03:40 +0900
-Subject: [PATCH] ADIOS v0.5.0
+Date: Wed, 8 Jan 2025 22:53:25 +0900
+Subject: [PATCH] ADIOS v0.5.2
 
 ---
- block/Kconfig.iosched |   9 +
- block/Makefile        |   8 +
- block/adios.c         | 998 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1015 insertions(+)
+ block/Kconfig.iosched |    9 +
+ block/Makefile        |    8 +
+ block/adios.c         | 1004 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1021 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..4852894ac9
+index 0000000000..26d5d79605
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,998 @@
+@@ -0,0 +1,1004 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -83,7 +83,7 @@ index 0000000000..4852894ac9
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.5.0"
++#define ADIOS_VERSION "0.5.2"
 +
 +static u64 global_latency_window = 16000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -219,6 +219,8 @@ index 0000000000..4852894ac9
 +};
 +
 +struct ad_rq_data {
++	struct request *rq;
++	
 +	u64 deadline;
 +	u64 predicted_latency;
 +	u64 block_size;
@@ -236,10 +238,8 @@ index 0000000000..4852894ac9
 +	struct rb_node **new = &(root->rb_node), *parent = NULL;
 +	struct ad_rq_data *rd = rq_data(rq);
 +
-+	if (!rd) {
-+		pr_err("adios_add_rq_rb_sort_list: rd is NULL\n");
++	if (WARN(!rd,"adios_add_rq_rb_sort_list: rd is NULL\n"))
 +		return;
-+	}
 +
 +	rd->block_size = blk_rq_bytes(rq);
 +	unsigned int optype = adios_optype(rq);
@@ -252,10 +252,8 @@ index 0000000000..4852894ac9
 +		struct request *this = rb_entry_rq(*new);
 +		struct ad_rq_data *td = rq_data(this);
 +
-+		if (!td) {
-+			pr_err("adios_add_rq_rb_sort_list: td is NULL\n");
++		if (WARN(!td,"adios_add_rq_rb_sort_list: td is NULL\n"))
 +			return;
-+		}
 +
 +		s64 diff = td->deadline - rd->deadline;
 +
@@ -273,15 +271,24 @@ index 0000000000..4852894ac9
 +static void
 +adios_add_rq_rb_pos_list(struct ad_data *ad, struct request *rq) {
 +	struct ad_rq_data *rd = rq_data(rq);
++
++	if (WARN(!rd,"adios_add_rq_rb_pos_list: rd is NULL\n"))
++		return;
++
 +	sector_t pos = blk_rq_pos(rq);
 +	struct rb_root *root = &ad->pos_list;
 +	struct rb_node **new = &(root->rb_node), *parent = NULL;
 +
 +	while (*new) {
-+		struct request *this = rb_entry_rq(*new);
++		struct ad_rq_data *td = rb_entry(*new, struct ad_rq_data, pos_node);
++
++		if (WARN(!td,"adios_add_rq_rb_pos_list: td is NULL\n"))
++			return;
++
++		struct request *trq = td->rq;
 +
 +		parent = *new;
-+		if (blk_rq_pos(this) >= pos)
++		if (blk_rq_pos(trq) >= pos)
 +			new = &((*new)->rb_left);
 +		else
 +			new = &((*new)->rb_right);
@@ -417,9 +424,9 @@ index 0000000000..4852894ac9
 +		lat += rd->predicted_latency;
 +
 +		// Check batch size and total predicted latency
-+		if (count && (ad->batch_count[page][optype] >=
-+				adios_max_batch_size[optype] ||
-+			lat > global_latency_window)) {
++		if (count && (!ad->latency_model[optype].intercept || 
++			(ad->batch_count[page][optype] >= adios_max_batch_size[optype] ||
++			lat > global_latency_window))) {
 +			break;
 +		}
 +
@@ -765,12 +772,11 @@ index 0000000000..4852894ac9
 +	rq->elv.priv[1] = NULL;
 +
 +	/* Allocate ad_rq_data from the memory pool */
-+	rd = kmem_cache_alloc(ad->ad_rq_data_pool, GFP_ATOMIC);
-+	if (!rd) {
-+		pr_err("ad_prepare_request: Failed to allocate memory from ad_rq_data_pool. rd is NULL\n");
++	rd = kmem_cache_zalloc(ad->ad_rq_data_pool, GFP_ATOMIC);
++	if (WARN(!rd, "ad_prepare_request: Failed to allocate memory from ad_rq_data_pool. rd is NULL\n"))
 +		return;
-+	}
 +
++	rd->rq = rq;
 +	rq->elv.priv[1] = rd;
 +}
 +
@@ -1002,9 +1008,9 @@ index 0000000000..4852894ac9
 +	DD_ATTR(max_batch_size_discard, adios_discard_max_batch_size_show, adios_discard_max_batch_size_store),
 +	DD_ATTR(max_batch_size_other, adios_other_max_batch_size_show, adios_other_max_batch_size_store),
 +
-+    DD_ATTR(max_batch_count, adios_max_batch_count_show, NULL),
-+    DD_ATTR(reset_bq_stats, NULL, adios_reset_bq_stats_store),
-+    DD_ATTR(reset_latency_model, NULL, adios_reset_latency_model_store),
++	DD_ATTR(max_batch_count, adios_max_batch_count_show, NULL),
++	DD_ATTR(reset_bq_stats, NULL, adios_reset_bq_stats_store),
++	DD_ATTR(reset_latency_model, NULL, adios_reset_latency_model_store),
 +
 +	DD_ATTR(global_latency_window, adios_global_latency_window_show, adios_global_latency_window_store),
 +	DD_ATTR(bq_refill_below_ratio, adios_bq_refill_below_ratio_show, adios_bq_refill_below_ratio_store),
