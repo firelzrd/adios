@@ -7,7 +7,6 @@ Concept Preview / Early Prototype
 
 ## To-do list:
 - latency-capped merging limitation
-- improved temporal tracking of performance
 - better scalability
 - latency-capped multi-class batching *DONE*
 - latency-based dispatch throttling *DONE*
@@ -15,4 +14,5 @@ Concept Preview / Early Prototype
 - debug outputs *DONE*
 - anomaly exclusion *DONE*
 - statistically more accurate curve finding *DONE*
+- improved temporal tracking of performance *DONE*
 
