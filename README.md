@@ -3,9 +3,10 @@ Based on mq-deadline and Kyber,
 with learning-based adaptive latency control  
 Concept Preview / Early Prototype
 
+**ADIOS was designed for non-rotational drives.**
+
 ## To-do list:
 - latency-capped merging limitation
-- statistically more accurate curve finding
 - improved temporal tracking of performance
 - better scalability
 - latency-capped multi-class batching *DONE*
@@ -13,4 +14,5 @@ Concept Preview / Early Prototype
 - configurability *DONE*
 - debug outputs *DONE*
 - anomaly exclusion *DONE*
+- statistically more accurate curve finding *DONE*
 

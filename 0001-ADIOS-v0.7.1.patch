@@ -1,13 +1,13 @@
-From 8657a436692c58c53b34b357e372faeb7dfddc22 Mon Sep 17 00:00:00 2001
+From fbc7e0c62dcdc9231f40f4e8b72945e3b9eeebbc Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 11 Jan 2025 08:07:13 +0900
-Subject: [PATCH] ADIOS v0.7.0
+Date: Sun, 12 Jan 2025 02:29:58 +0900
+Subject: [PATCH] ADIOS v0.7.1
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1159 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1176 insertions(+)
+ block/adios.c         | 1162 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1179 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -31,14 +31,14 @@ index 27f11320b8..dd9af8cd7b 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index ddfd21c1a9..7932c61ba7 100644
+index ddfd21c1a9..ebe14e94d1 100644
 --- a/block/Makefile
 +++ b/block/Makefile
 @@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
-+obj-m	+= adios.o
++obj-$(CONFIG_MQ_IOSCHED_ADIOS)	+= adios.o
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
@@ -55,10 +55,10 @@ index ddfd21c1a9..7932c61ba7 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..50304c7231
+index 0000000000..071f206271
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1159 @@
+@@ -0,0 +1,1162 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -71,6 +71,7 @@ index 0000000000..50304c7231
 +#include <linux/fs.h>
 +#include <linux/blkdev.h>
 +#include <linux/bio.h>
++#include <linux/math.h>
 +#include <linux/module.h>
 +#include <linux/slab.h>
 +#include <linux/init.h>
@@ -84,7 +85,7 @@ index 0000000000..50304c7231
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.7.0"
++#define ADIOS_VERSION "0.7.1"
 +
 +static u64 global_latency_window = 16000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -179,7 +180,7 @@ index 0000000000..50304c7231
 +	u32 threshold_count = 0;
 +	u32 cumulative_count = 0;
 +	u32 outlier_threshold_bucket = 0;
-+	u64 sum_latency = 0, sum_bucket_count = 0;
++	u64 sum_latency = 0, sum_count = 0;
 +	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
 +
 +	if (count_all)
@@ -202,8 +203,7 @@ index 0000000000..50304c7231
 +		struct latency_bucket *bucket = &model->small_bucket[i];
 +		if (i < outlier_threshold_bucket) {
 +			sum_latency += bucket->sum_latency;
-+			sum_bucket_count += bucket->count;
-+			model->small_count += bucket->count;
++			sum_count += bucket->count;
 +		} else {
 +			// For the threshold bucket, calculate the contribution proportionally
 +			u64 remaining_count =
@@ -212,13 +212,13 @@ index 0000000000..50304c7231
 +				sum_latency +=
 +					(bucket->sum_latency * remaining_count) / bucket->count;
 +			}
-+			sum_bucket_count += remaining_count;
++			sum_count += remaining_count;
 +		}
 +	}
 +
 +	// Accumulate the average latency into the statistics
 +	model->small_sum_delay += sum_latency;
-+	model->small_count += sum_bucket_count;
++	model->small_count += sum_count;
 +
 +	// Reset small bucket information
 +	memset(model->small_bucket, 0, sizeof(model->small_bucket[0]) * LM_NUM_BUCKETS);
@@ -239,8 +239,8 @@ index 0000000000..50304c7231
 +	unsigned int threshold_count = 0;
 +	unsigned int cumulative_count = 0;
 +	unsigned int outlier_threshold_bucket = 0;
-+	u64 sum_latency = 0;
-+	u64 sum_block_size = 0;
++	s64 sum_latency = 0;
++	u64 sum_block_size = 0, intercept;
 +	u32 outlier_percentile = LM_OUTLIER_PERCENTILE;
 +
 +	if (count_all)
@@ -277,7 +277,9 @@ index 0000000000..50304c7231
 +	}
 +
 +	// Accumulate the average delay into the statistics
-+	model->large_sum_delay += sum_latency;
++	intercept = model->base * threshold_count;
++	if (sum_latency > intercept)
++		model->large_sum_delay += sum_latency - intercept;
 +	model->large_sum_block_size += sum_block_size;
 +
 +	// Reset large bucket information
@@ -324,7 +326,8 @@ index 0000000000..50304c7231
 +
 +	// Update the slope parameter if large bucket was processed
 +	if (large_processed && model->large_sum_block_size)
-+		model->slope = div_u64(model->large_sum_delay, model->large_sum_block_size);
++		model->slope = div_u64(model->large_sum_delay,
++			DIV_ROUND_UP_ULL(model->large_sum_block_size, 1024));
 +
 +	// Reset statistics and update last updated jiffies if time has elapsed
 +	if (time_elapsed)
@@ -372,7 +375,7 @@ index 0000000000..50304c7231
 +
 +		model->large_bucket[bucket_index].count++;
 +		model->large_bucket[bucket_index].sum_latency += latency;
-+		model->large_bucket[bucket_index].sum_block_size += block_size / 1024;
++		model->large_bucket[bucket_index].sum_block_size += block_size;
 +	}
 +
 +	spin_unlock_irqrestore(&model->buckets_lock, flags);
@@ -994,7 +997,7 @@ index 0000000000..50304c7231
 +	len += sprintf(page + len, "slope: %llu ns / kB\n", model->slope);	\
 +	len += sprintf(page + len, "small: %llu ns / %llu rq\n", \
 +		model->small_sum_delay, model->small_count);\
-+	len += sprintf(page + len, "large: %llu ns / %llu kB\n", \
++	len += sprintf(page + len, "large: %llu ns / %llu B\n", \
 +		model->large_sum_delay, model->large_sum_block_size);\
 +	spin_unlock_irqrestore(&model->lock, flags); \
 +	return len;							\
