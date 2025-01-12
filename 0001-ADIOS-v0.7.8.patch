@@ -1,13 +1,13 @@
-From 7190cad47ff0c4387b24d85e7467ae195db2971b Mon Sep 17 00:00:00 2001
+From 0ce4b810158ae0e8ae1b31e258c8645d73fde69b Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 12 Jan 2025 10:16:28 +0900
-Subject: [PATCH] ADIOS v0.7.7
+Date: Mon, 13 Jan 2025 01:27:45 +0900
+Subject: [PATCH] ADIOS v0.7.8
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1197 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1214 insertions(+)
+ block/adios.c         | 1188 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1205 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..18b74d59fc
+index 0000000000..d7421f3f45
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1197 @@
+@@ -0,0 +1,1188 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..18b74d59fc
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.7.7"
++#define ADIOS_VERSION "0.7.8"
 +
 +static u64 global_latency_window = 16000000ULL;
 +static int bq_refill_below_ratio = 15;
@@ -441,7 +441,7 @@ index 0000000000..18b74d59fc
 +	uint32_t dispatched;
 +	atomic_t completed;
 +
-+	uint32_t batch_size_actual_highest[ADIOS_NUM_OPTYPES];
++	uint32_t batch_size_actual_high[ADIOS_NUM_OPTYPES];
 +};
 +
 +#define ADIOS_NUM_BQ_PAGES 2
@@ -640,8 +640,8 @@ index 0000000000..18b74d59fc
 +	if (count) {
 +		ad->more_bq_ready = true;
 +		for (int optype = 0; optype < ADIOS_NUM_OPTYPES; optype++) {
-+			if (ad->stats.batch_size_actual_highest[optype] < optype_count[optype])
-+				ad->stats.batch_size_actual_highest[optype] = optype_count[optype];
++			if (ad->stats.batch_size_actual_high[optype] < optype_count[optype])
++				ad->stats.batch_size_actual_high[optype] = optype_count[optype];
 +		}
 +	}
 +	return count;
@@ -1029,11 +1029,7 @@ index 0000000000..18b74d59fc
 +	unsigned long flags; \
 +	spin_lock_irqsave(&model->lock, flags); \
 +	len += sprintf(page,       "base : %llu ns\n", model->base);	\
-+	len += sprintf(page + len, "slope: %llu ns / kB\n", model->slope);	\
-+	len += sprintf(page + len, "small: %llu ns / %llu rq\n", \
-+		model->small_sum_delay, model->small_count);\
-+	len += sprintf(page + len, "large: %llu ns / %llu B\n", \
-+		model->large_sum_delay, model->large_sum_bsize);\
++	len += sprintf(page + len, "slope: %llu ns/KiB\n", model->slope);	\
 +	spin_unlock_irqrestore(&model->lock, flags); \
 +	return len;							\
 +} \
@@ -1077,21 +1073,19 @@ index 0000000000..18b74d59fc
 +SYSFS_OPTYPE_DECL(read, ADIOS_READ);
 +SYSFS_OPTYPE_DECL(write, ADIOS_WRITE);
 +SYSFS_OPTYPE_DECL(discard, ADIOS_DISCARD);
-+SYSFS_OPTYPE_DECL(other, ADIOS_OTHER);
 +
-+static ssize_t adios_batch_size_actual_highest_show(struct elevator_queue *e, char *page) {
++static ssize_t adios_batch_size_actual_high_show(struct elevator_queue *e, char *page) {
 +	struct adios_data *ad = e->elevator_data;
-+	unsigned int read_count, write_count, discard_count, other_count;
++	unsigned int read_count, write_count, discard_count;
 +
 +	guard(spinlock)(&ad->lock);
-+	read_count = ad->stats.batch_size_actual_highest[ADIOS_READ];
-+	write_count = ad->stats.batch_size_actual_highest[ADIOS_WRITE];
-+	discard_count = ad->stats.batch_size_actual_highest[ADIOS_DISCARD];
-+	other_count = ad->stats.batch_size_actual_highest[ADIOS_OTHER];
++	read_count = ad->stats.batch_size_actual_high[ADIOS_READ];
++	write_count = ad->stats.batch_size_actual_high[ADIOS_WRITE];
++	discard_count = ad->stats.batch_size_actual_high[ADIOS_DISCARD];
 +
 +	return sprintf(page,
-+		"Read   : %u\nWrite  : %u\nDiscard: %u\nOther  : %u\n",
-+		read_count, write_count, discard_count, other_count);
++		"Read   : %u\nWrite  : %u\nDiscard: %u\n",
++		read_count, write_count, discard_count);
 +}
 +
 +static ssize_t adios_reset_bq_stats_store(struct elevator_queue *e, const char *page, size_t count) {
@@ -1105,7 +1099,7 @@ index 0000000000..18b74d59fc
 +
 +	guard(spinlock)(&ad->lock);
 +	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++)
-+		ad->stats.batch_size_actual_highest[i] = 0;
++		ad->stats.batch_size_actual_high[i] = 0;
 +
 +	return count;
 +}
@@ -1189,24 +1183,21 @@ index 0000000000..18b74d59fc
 +
 +static struct elv_fs_entry adios_sched_attrs[] = {
 +	DD_ATTR(adios_version, adios_version_show, NULL),
-+	DD_ATTR_RO(batch_size_actual_highest),
++	DD_ATTR_RO(batch_size_actual_high),
 +	DD_ATTR_RW(bq_refill_below_ratio),
 +	DD_ATTR_RW(global_latency_window),
 +
 +	DD_ATTR_RW(batch_size_limit_read),
 +	DD_ATTR_RW(batch_size_limit_write),
 +	DD_ATTR_RW(batch_size_limit_discard),
-+	DD_ATTR_RW(batch_size_limit_other),
 +
 +	DD_ATTR_RO(lat_model_read),
 +	DD_ATTR_RO(lat_model_write),
 +	DD_ATTR_RO(lat_model_discard),
-+	DD_ATTR_RO(lat_model_other),
 +
 +	DD_ATTR_RW(lat_target_read),
 +	DD_ATTR_RW(lat_target_write),
 +	DD_ATTR_RW(lat_target_discard),
-+	DD_ATTR_RW(lat_target_other),
 +
 +	DD_ATTR_WO(reset_bq_stats),
 +	DD_ATTR_WO(reset_latency_model),
