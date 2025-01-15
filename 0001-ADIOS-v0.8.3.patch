@@ -1,7 +1,7 @@
 From c73dc8e3ce36e3845c57593d2aa7ebda88bf95ba Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Wed, 15 Jan 2025 17:18:16 +0900
-Subject: [PATCH] ADIOS v0.8.2
+Subject: [PATCH] ADIOS v0.8.3
 
 ---
  block/Kconfig.iosched |    9 +
@@ -85,7 +85,7 @@ index 0000000000..bbd73ee92d
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.8.2"
++#define ADIOS_VERSION "0.8.3"
 +
 +// Global variable to control the latency
 +static u64 global_latency_window = 16000000ULL;
@@ -535,7 +535,7 @@ index 0000000000..bbd73ee92d
 +		s64 diff = rd->deadline - dl_list->deadline;
 +
 +		parent = *link;
-+		if (diff < 0) {
++		if (diff <= 0) {
 +			link = &((*link)->rb_left);
 +		} else {
 +			link = &((*link)->rb_right);
