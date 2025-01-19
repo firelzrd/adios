@@ -1,7 +1,7 @@
 From c73dc8e3ce36e3845c57593d2aa7ebda88bf95ba Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Wed, 15 Jan 2025 17:18:16 +0900
-Subject: [PATCH] ADIOS v0.8.3
+Subject: [PATCH] ADIOS v0.8.4
 
 ---
  block/Kconfig.iosched |    9 +
@@ -85,10 +85,10 @@ index 0000000000..bbd73ee92d
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.8.3"
++#define ADIOS_VERSION "0.8.4"
 +
 +// Global variable to control the latency
-+static u64 global_latency_window = 16000000ULL;
++static u64 global_latency_window = 60000000ULL;
 +// Ratio below which batch queues should be refilled
 +static int bq_refill_below_ratio = 15;
 +
