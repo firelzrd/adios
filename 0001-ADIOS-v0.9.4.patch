@@ -1,13 +1,13 @@
-From 303be6680b396ca2737fac0ce871dcb2ac06c426 Mon Sep 17 00:00:00 2001
+From 5a9e02f31389b0791f219607526ffba051109a0d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 19 Jan 2025 17:59:23 +0900
-Subject: [PATCH] ADIOS v0.9.3
+Date: Mon, 20 Jan 2025 00:23:40 +0900
+Subject: [PATCH] ADIOS v0.9.4
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1181 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1198 insertions(+)
+ block/adios.c         | 1183 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1200 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..4d6a992067
+index 0000000000..db5b5cd76d
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1181 @@
+@@ -0,0 +1,1183 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..4d6a992067
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.9.3"
++#define ADIOS_VERSION "0.9.4"
 +
 +// Global variable to control the latency
 +static u64 global_latency_window = 60000000ULL;
@@ -524,11 +524,13 @@ index 0000000000..4d6a992067
 +		s64 diff = rd->deadline - dl_list->deadline;
 +
 +		parent = *link;
-+		if (diff <= 0) {
++		if (diff < 0) {
 +			link = &((*link)->rb_left);
-+		} else {
++		} else if (diff > 0) {
 +			link = &((*link)->rb_right);
 +			leftmost = false;
++		} else { // diff == 0
++			goto found;
 +		}
 +	}
 +
@@ -542,7 +544,7 @@ index 0000000000..4d6a992067
 +		rb_link_node(&dl_list->node, parent, link);
 +		rb_insert_color_cached(&dl_list->node, root, leftmost);
 +	}
-+
++found:
 +	list_add_tail(&rd->dl_node, &dl_list->head);
 +	rd->dl_list = &dl_list->head;
 +}
