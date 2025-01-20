@@ -1,7 +1,7 @@
-From 5a9e02f31389b0791f219607526ffba051109a0d Mon Sep 17 00:00:00 2001
+From 77c413047b7e19c348eb80c55e734235ba64611b Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 20 Jan 2025 00:23:40 +0900
-Subject: [PATCH] ADIOS v0.9.4
+Date: Mon, 20 Jan 2025 19:06:58 +0900
+Subject: [PATCH] ADIOS v0.9.5
 
 ---
  block/Kconfig.iosched |    9 +
@@ -55,7 +55,7 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..db5b5cd76d
+index 0000000000..914e143a80
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1183 @@
@@ -85,10 +85,10 @@ index 0000000000..db5b5cd76d
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.9.4"
++#define ADIOS_VERSION "0.9.5"
 +
 +// Global variable to control the latency
-+static u64 global_latency_window = 60000000ULL;
++static u64 global_latency_window = 4000000ULL;
 +// Ratio below which batch queues should be refilled
 +static int bq_refill_below_ratio = 15;
 +
@@ -126,8 +126,8 @@ index 0000000000..db5b5cd76d
 +
 +// Maximum batch size limits for each operation type
 +static unsigned int adios_batch_size_limit[ADIOS_NUM_OPTYPES] = {
-+	[ADIOS_READ]    = 64,
-+	[ADIOS_WRITE]   = 32,
++	[ADIOS_READ]    = 16,
++	[ADIOS_WRITE]   =  8,
 +	[ADIOS_DISCARD] =  1,
 +	[ADIOS_OTHER]   =  1,
 +};
