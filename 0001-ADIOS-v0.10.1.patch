@@ -1,13 +1,13 @@
-From 507d18f579e7bf4c9adfbae63bad7aacb684a39f Mon Sep 17 00:00:00 2001
+From 3e04ca8f57e4fe1b4ddc1221af4250d444dfc621 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 24 Jan 2025 12:04:46 +0900
-Subject: [PATCH] ADIOS v0.10.0
+Date: Fri, 24 Jan 2025 19:17:29 +0900
+Subject: [PATCH] ADIOS v0.10.1
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1188 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1205 insertions(+)
+ block/adios.c         | 1190 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1207 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..96ea74a720
+index 0000000000..b9fd4f2b48
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1188 @@
+@@ -0,0 +1,1190 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..96ea74a720
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.10.0"
++#define ADIOS_VERSION "0.10.1"
 +
 +// Global variable to control the latency
 +static u64 global_latency_window = 16000000ULL;
@@ -688,27 +688,27 @@ index 0000000000..96ea74a720
 +
 +	tpl = atomic64_read(&ad->total_predicted_latency);
 +
-+	if (!ad->more_bq_ready && (!tpl ||
++	if (!ad->more_bq_ready &&(!tpl ||
 +			tpl < global_latency_window * bq_refill_below_ratio / 100))
 +		adios_fill_batch_queues(ad, tpl);
 +
-+	while(true) {
-+		// Check if there are any requests in the batch queues
-+		for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
-+			if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
-+				rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
-+										struct request, queuelist);
-+				list_del_init(&rq->queuelist);
-+				return rq;
-+			}
++again:
++	// Check if there are any requests in the batch queues
++	for (int i = 0; i < ADIOS_NUM_OPTYPES; i++) {
++		if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
++			rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
++									struct request, queuelist);
++			list_del_init(&rq->queuelist);
++			return rq;
 +		}
-+
-+		if (!ad->more_bq_ready)
-+			break;
-+
-+		// If there's more batch queue page available, flip to it and retry
-+		adios_flip_bq(ad);
 +	}
++
++	// If there's more batch queue page available, flip to it and retry
++	if (ad->more_bq_ready) {
++		adios_flip_bq(ad);
++		goto again;
++	}
++
 +	return NULL;
 +}
 +
@@ -978,11 +978,8 @@ index 0000000000..96ea74a720
 +	}
 +}
 +
-+static inline bool dlq_has_work(struct adios_data *ad) {
-+	return !RB_EMPTY_ROOT(&ad->dl_queue.rb_root);
-+}
-+
 +static inline bool pq_has_work(struct adios_data *ad) {
++	guard(spinlock)(&ad->pq_lock);
 +	return !list_empty_careful(&ad->prio_queue);
 +}
 +
@@ -996,11 +993,16 @@ index 0000000000..96ea74a720
 +	return ad->more_bq_ready;
 +}
 +
++static inline bool dlq_has_work(struct adios_data *ad) {
++	guard(spinlock)(&ad->lock);
++	return !RB_EMPTY_ROOT(&ad->dl_queue.rb_root);
++}
++
 +// Check if there are any requests available for dispatch
 +static bool adios_has_work(struct blk_mq_hw_ctx *hctx) {
 +	struct adios_data *ad = hctx->queue->elevator->elevator_data;
 +
-+	return bq_has_work(ad) || dlq_has_work(ad) || pq_has_work(ad);
++	return pq_has_work(ad) || bq_has_work(ad) || dlq_has_work(ad);
 +}
 +
 +// Define sysfs attributes for read operation latency model
@@ -1167,12 +1169,12 @@ index 0000000000..96ea74a720
 +		return -EINVAL;
 +
 +	bq_refill_below_ratio = ratio;
++
 +	return count;
 +}
 +
 +// Show the ADIOS version
-+static ssize_t adios_version_show(struct elevator_queue *e, char *page)
-+{
++static ssize_t adios_version_show(struct elevator_queue *e, char *page) {
 +	return sprintf(page, "%s\n", ADIOS_VERSION);
 +}
 +
