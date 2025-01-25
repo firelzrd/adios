@@ -1,13 +1,13 @@
-From 93aa739c2c0c3cb16b66d97574db7b333d501d38 Mon Sep 17 00:00:00 2001
+From 3f45fe7b8f1e2788a8878f4ec80d1ac642eb6dde Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 25 Jan 2025 13:09:25 +0900
-Subject: [PATCH] ADIOS v0.11.1
+Date: Sat, 25 Jan 2025 23:36:31 +0900
+Subject: [PATCH] ADIOS v0.12.0
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1188 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1205 insertions(+)
+ block/adios.c         | 1198 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1215 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..28e0a2af9c
+index 0000000000..8cb19bb60e
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1188 @@
+@@ -0,0 +1,1198 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..28e0a2af9c
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.11.1"
++#define ADIOS_VERSION "0.12.0"
 +
 +// Global variable to control the latency
 +static u64 global_latency_window = 16000000ULL;
@@ -102,7 +102,7 @@ index 0000000000..28e0a2af9c
 +};
 +
 +// Latency targets for each operation type
-+static u64 latency_target[ADIOS_OPTYPES] = {
++static u64 default_latency_target[ADIOS_OPTYPES] = {
 +	[ADIOS_READ]    =    2ULL * NSEC_PER_MSEC,
 +	[ADIOS_WRITE]   =  750ULL * NSEC_PER_MSEC,
 +	[ADIOS_DISCARD] = 5000ULL * NSEC_PER_MSEC,
@@ -110,7 +110,7 @@ index 0000000000..28e0a2af9c
 +};
 +
 +// Maximum batch size limits for each operation type
-+static unsigned int batch_limit[ADIOS_OPTYPES] = {
++static u32 default_batch_limit[ADIOS_OPTYPES] = {
 +	[ADIOS_READ]    = 16,
 +	[ADIOS_WRITE]   =  8,
 +	[ADIOS_DISCARD] =  1,
@@ -177,6 +177,9 @@ index 0000000000..28e0a2af9c
 +
 +	struct kmem_cache *rq_data_pool;
 +	struct kmem_cache *dl_group_pool;
++
++	u64 latency_target[ADIOS_OPTYPES];
++	u32 batch_limit[ADIOS_OPTYPES];
 +};
 +
 +// List of requests with the same deadline in the deadline-sorted red-black tree
@@ -502,7 +505,7 @@ index 0000000000..28e0a2af9c
 +	rd->pred_lat =
 +		latency_model_predict(&ad->latency_model[optype], rd->block_size);
 +	rd->deadline =
-+		rq->start_time_ns + latency_target[optype] + rd->pred_lat;
++		rq->start_time_ns + ad->latency_target[optype] + rd->pred_lat;
 +
 +	while (*link) {
 +		dl_group = rb_entry(*link, struct dl_group, node);
@@ -753,7 +756,7 @@ index 0000000000..28e0a2af9c
 +
 +		// Check batch size and total predicted latency
 +		if (count && (!ad->latency_model[optype].base || 
-+			ad->batch_count[page][optype] >= batch_limit[optype] ||
++			ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
 +			current_lat > global_latency_window)) {
 +			break;
 +		}
@@ -820,7 +823,7 @@ index 0000000000..28e0a2af9c
 +	return NULL;
 +}
 +
-+// Dispatch a request from the batch queues
++// Dispatch a request from the priority queue
 +static struct request *dispatch_from_pq(struct adios_data *ad) {
 +	struct request *rq = NULL;
 +
@@ -962,6 +965,10 @@ index 0000000000..28e0a2af9c
 +		memset(model->large_bucket, 0,
 +			sizeof(model->large_bucket[0]) * LM_LAT_BUCKET_COUNT);
 +		model->last_update_jiffies = jiffies;
++
++		// Initialize latency_target and batch_limit per adios_data
++		ad->latency_target[i] = default_latency_target[i];
++		ad->batch_limit[i] = default_batch_limit[i];
 +	}
 +	timer_setup(&ad->update_timer, update_timer_callback, 0);
 +	init_batch_queues(ad);
@@ -1024,13 +1031,14 @@ index 0000000000..28e0a2af9c
 +		return ret;									\
 +											\
 +	ad->latency_model[optype].base = 0ULL;					\
-+	latency_target[optype] = nsec;						\
++	ad->latency_target[optype] = nsec;						\
 +											\
 +	return count;									\
 +}										\
 +static ssize_t adios_lat_target_##name##_show( \
 +		struct elevator_queue *e, char *page) { \
-+	return sprintf(page, "%llu\n", latency_target[optype]);			\
++	struct adios_data *ad = e->elevator_data;						\
++	return sprintf(page, "%llu\n", ad->latency_target[optype]);			\
 +} \
 +static ssize_t adios_batch_limit_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
@@ -1041,13 +1049,15 @@ index 0000000000..28e0a2af9c
 +	if (ret || max_batch == 0)							\
 +		return -EINVAL;								\
 +											\
-+	batch_limit[optype] = max_batch;					\
++	struct adios_data *ad = e->elevator_data;					\
++	ad->batch_limit[optype] = max_batch;					\
 +											\
 +	return count;									\
 +}										\
 +static ssize_t adios_batch_limit_##name##_show( \
 +		struct elevator_queue *e, char *page) { \
-+	return sprintf(page, "%u\n", batch_limit[optype]);				\
++	struct adios_data *ad = e->elevator_data;						\
++	return sprintf(page, "%u\n", ad->batch_limit[optype]);				\
 +}
 +
 +SYSFS_OPTYPE_DECL(read, ADIOS_READ);
