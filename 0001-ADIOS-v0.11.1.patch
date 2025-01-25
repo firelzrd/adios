@@ -1,13 +1,13 @@
-From f5f5b162ff3ac8e69dde285b518ca1ff3f2578d5 Mon Sep 17 00:00:00 2001
+From 93aa739c2c0c3cb16b66d97574db7b333d501d38 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 25 Jan 2025 00:11:09 +0900
-Subject: [PATCH] ADIOS v0.11.0
+Date: Sat, 25 Jan 2025 13:09:25 +0900
+Subject: [PATCH] ADIOS v0.11.1
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1190 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1207 insertions(+)
+ block/adios.c         | 1188 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1205 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..8447f333f5
+index 0000000000..28e0a2af9c
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1190 @@
+@@ -0,0 +1,1188 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..8447f333f5
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "0.11.0"
++#define ADIOS_VERSION "0.11.1"
 +
 +// Global variable to control the latency
 +static u64 global_latency_window = 16000000ULL;
@@ -354,7 +354,7 @@ index 0000000000..8447f333f5
 +	bool time_elapsed;
 +	bool small_processed = false, large_processed = false;
 +
-+	spin_lock_irqsave(&model->lock, flags);
++	guard(spinlock_irqsave)(&model->lock);
 +
 +	spin_lock_irqsave(&model->buckets_lock, flags);
 +
@@ -392,8 +392,6 @@ index 0000000000..8447f333f5
 +	// Reset statistics and update last updated jiffies if time has elapsed
 +	if (time_elapsed)
 +		model->last_update_jiffies = now;
-+
-+	spin_unlock_irqrestore(&model->lock, flags);
 +}
 +
 +// Determine the bucket index for a given measured latency and predicted latency
@@ -459,16 +457,14 @@ index 0000000000..8447f333f5
 +
 +// Predict the latency for a given block size using the latency model
 +static u64 latency_model_predict(struct latency_model *model, u64 block_size) {
-+	unsigned long flags;
 +	u64 result;
 +
-+	spin_lock_irqsave(&model->lock, flags);
++	guard(spinlock_irqsave)(&model->lock);
 +	// Predict latency based on the model
 +	result = model->base;
 +	if (block_size > LM_BLOCK_SIZE_THRESHOLD)
 +		result += model->slope *
 +			DIV_ROUND_UP_ULL(block_size - LM_BLOCK_SIZE_THRESHOLD, 1024);
-+	spin_unlock_irqrestore(&model->lock, flags);
 +
 +	return result;
 +}
@@ -624,13 +620,14 @@ index 0000000000..8447f333f5
 +// Attempt to merge a bio into an existing request before associating it with a request
 +static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 +		unsigned int nr_segs) {
++	unsigned long flags;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
 +	bool ret;
 +
-+	spin_lock(&ad->lock);
++	spin_lock_irqsave(&ad->lock, flags);
 +	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
-+	spin_unlock(&ad->lock);
++	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	if (free)
 +		blk_mq_free_request(free);
@@ -640,16 +637,17 @@ index 0000000000..8447f333f5
 +
 +// Insert a request into the scheduler
 +static void insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
-+				  blk_insert_t flags, struct list_head *free) {
++				  blk_insert_t insert_flags, struct list_head *free) {
++	unsigned long flags;
 +	struct request_queue *q = hctx->queue;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +
 +	lockdep_assert_held(&ad->lock);
 +
-+	if (flags & BLK_MQ_INSERT_AT_HEAD) {
-+		spin_lock(&ad->pq_lock);
++	if (insert_flags & BLK_MQ_INSERT_AT_HEAD) {
++		spin_lock_irqsave(&ad->pq_lock, flags);
 +		list_add(&rq->queuelist, &ad->prio_queue);
-+		spin_unlock(&ad->pq_lock);
++		spin_unlock_irqrestore(&ad->pq_lock, flags);
 +		return;
 +	}
 +
@@ -668,20 +666,21 @@ index 0000000000..8447f333f5
 +// Insert multiple requests into the scheduler
 +static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 +				   struct list_head *list,
-+				   blk_insert_t flags) {
++				   blk_insert_t insert_flags) {
++	unsigned long flags;
 +	struct request_queue *q = hctx->queue;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	LIST_HEAD(free);
 +
-+	spin_lock(&ad->lock);
++	spin_lock_irqsave(&ad->lock, flags);
 +	while (!list_empty(list)) {
 +		struct request *rq;
 +
 +		rq = list_first_entry(list, struct request, queuelist);
 +		list_del_init(&rq->queuelist);
-+		insert_request(hctx, rq, flags, &free);
++		insert_request(hctx, rq, insert_flags, &free);
 +	}
-+	spin_unlock(&ad->lock);
++	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	blk_mq_free_requests(&free);
 +}
@@ -734,6 +733,7 @@ index 0000000000..8447f333f5
 +
 +// Fill the batch queues with requests from the deadline-sorted red-black tree
 +static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
++	unsigned long flags;
 +	unsigned int count = 0;
 +	unsigned int optype_count[ADIOS_OPTYPES];
 +	memset(optype_count, 0, sizeof(optype_count));
@@ -741,7 +741,7 @@ index 0000000000..8447f333f5
 +
 +	reset_batch_counts(ad, page);
 +
-+	spin_lock(&ad->lock);
++	spin_lock_irqsave(&ad->lock, flags);
 +	while (true) {
 +		struct request *rq = get_ealiest_request(ad);
 +		if (!rq)
@@ -767,7 +767,7 @@ index 0000000000..8447f333f5
 +		optype_count[optype]++;
 +		count++;
 +	}
-+	spin_unlock(&ad->lock);
++	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	if (count) {
 +		ad->more_bq_ready = true;
@@ -792,7 +792,7 @@ index 0000000000..8447f333f5
 +	struct request *rq = NULL;
 +	u64 tpl;
 +
-+	guard(spinlock)(&ad->bq_lock);
++	guard(spinlock_irqsave)(&ad->bq_lock);
 +
 +	tpl = atomic64_read(&ad->total_pred_lat);
 +
@@ -824,7 +824,7 @@ index 0000000000..8447f333f5
 +static struct request *dispatch_from_pq(struct adios_data *ad) {
 +	struct request *rq = NULL;
 +
-+	guard(spinlock)(&ad->pq_lock);
++	guard(spinlock_irqsave)(&ad->pq_lock);
 +
 +	if (!list_empty(&ad->prio_queue)) {
 +		rq = list_first_entry(&ad->prio_queue, struct request, queuelist);
@@ -884,12 +884,12 @@ index 0000000000..8447f333f5
 +}
 +
 +static inline bool pq_has_work(struct adios_data *ad) {
-+	guard(spinlock)(&ad->pq_lock);
-+	return !list_empty_careful(&ad->prio_queue);
++	guard(spinlock_irqsave)(&ad->pq_lock);
++	return !list_empty(&ad->prio_queue);
 +}
 +
 +static inline bool bq_has_work(struct adios_data *ad) {
-+	guard(spinlock)(&ad->bq_lock);
++	guard(spinlock_irqsave)(&ad->bq_lock);
 +
 +	for (int i = 0; i < ADIOS_OPTYPES; i++)
 +		if (!list_empty(&ad->batch_queue[ad->bq_page][i]))
@@ -899,7 +899,7 @@ index 0000000000..8447f333f5
 +}
 +
 +static inline bool dl_tree_has_work(struct adios_data *ad) {
-+	guard(spinlock)(&ad->lock);
++	guard(spinlock_irqsave)(&ad->lock);
 +	return !RB_EMPTY_ROOT(&ad->dl_tree.rb_root);
 +}
 +
@@ -1008,11 +1008,9 @@ index 0000000000..8447f333f5
 +	struct adios_data *ad = e->elevator_data;				\
 +	struct latency_model *model = &ad->latency_model[optype];		\
 +	ssize_t len = 0;						\
-+	unsigned long flags; \
-+	spin_lock_irqsave(&model->lock, flags); \
++	guard(spinlock_irqsave)(&model->lock); \
 +	len += sprintf(page,       "base : %llu ns\n", model->base);	\
 +	len += sprintf(page + len, "slope: %llu ns/KiB\n", model->slope);	\
-+	spin_unlock_irqrestore(&model->lock, flags); \
 +	return len;							\
 +} \
 +static ssize_t adios_lat_target_##name##_store( \
