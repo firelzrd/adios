@@ -27,8 +27,6 @@
 
 ADIOS provides several tunables via sysfs, allowing users to fine-tune its behavior. These attributes can be found under `/sys/block/<device_name>/queue/iosched/`
 
-**Note:** ADIOS is currently in its early development stage. Recommended ranges for these tunables are still under investigation, and their default values should be considered experimental.
-
 *   **`adios_version`**: (Read-only) Displays the current version of the ADIOS scheduler.
 
 *   **`batch_size_actual_high`**: (Read-only) Shows the maximum batch size achieved by each operation type (Read, Write, Discard).
