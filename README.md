@@ -4,11 +4,11 @@
 
 *   **Optimized for Non-Rotational Devices:** ADIOS is primarily designed and optimized for non-rotational storage devices such as Solid State Drives (SSDs), NVMe drives, USB thumb drives, SD cards and so on. While it might function on rotational drives, performance characteristics on those devices are not a primary focus.
 
+*   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks, by prioritizing synchronous operations.
+
 *   **Adaptive Latency Control:** ADIOS continuously learns the latency profile of the storage device by monitoring the actual completion times of I/O requests. This learned profile is used to predict the completion time for subsequent requests, allowing it to adapt to varying I/O characteristics.
 
 *   **Dynamic Deadline Adjustment:** Using the learned latency profile, ADIOS dynamically adjusts the deadline for each I/O request. It packs as many I/O requests as possible within a configurable global latency window, maximizing the benefits of batching while maintaining responsiveness.
-
-*   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks, by prioritizing synchronous operations.
 
 *   **Double-Buffering Batch Queues:** ADIOS employs a double-buffering technique for its batch queues, allowing it to fill one queue while dispatching requests from the other. This helps to avoid dispatch stalls and keep the underlying storage devices busy.
     
