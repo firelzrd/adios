@@ -1,7 +1,7 @@
 From b0f569f5ee3726ecd15dfb462eda4ccb11d80622 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Thu, 30 Jan 2025 22:43:17 +0900
-Subject: [PATCH] ADIOS v1.5.0
+Subject: [PATCH] ADIOS v1.5.1
 
 ---
  block/Kconfig.iosched |    9 +
@@ -85,7 +85,7 @@ index 0000000000..544b80c3cb
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "1.5.0"
++#define ADIOS_VERSION "1.5.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -215,7 +215,7 @@ index 0000000000..544b80c3cb
 +	u32 block_size;
 +} __attribute__((aligned(64)));
 +
-+const int sched_prio_to_weight[40] = {
++const static int adios_prio_to_weight[40] = {
 + /* -20 */     88761,     71755,     56483,     46273,     36291,
 + /* -15 */     29154,     23254,     18705,     14949,     11916,
 + /* -10 */      9548,      7620,      6100,      4904,      3906,
@@ -784,7 +784,7 @@ index 0000000000..544b80c3cb
 +			ad->dl_bias = sign;
 +		else {
 +			ad->dl_bias += sign * (s64)((rd->pred_lat *
-+				sched_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
++				adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
 +		}
 +	}
 +
