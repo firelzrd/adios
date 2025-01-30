@@ -2,9 +2,9 @@
 
 ## Key Features
 
-*   **Optimized for Non-Rotational Devices:** ADIOS is primarily designed and optimized for non-rotational storage devices such as Solid State Drives (SSDs), NVMe drives, USB thumb drives, SD cards and so on. While it might function on rotational drives, performance characteristics on those devices are not a primary focus.
+*   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks.
 
-*   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks, by prioritizing synchronous operations.
+*   **Optimized for Non-Rotational Devices:** ADIOS is primarily designed and optimized for non-rotational storage devices such as Solid State Drives (SSDs), NVMe drives, USB thumb drives, SD cards and so on. While it might function on rotational drives, performance characteristics on those devices are not a primary focus.
 
 *   **Adaptive Latency Control:** ADIOS continuously learns the latency profile of the storage device by monitoring the actual completion times of I/O requests. This learned profile is used to predict the completion time for subsequent requests, allowing it to adapt to varying I/O characteristics.
 
@@ -35,11 +35,13 @@ ADIOS provides several tunables via sysfs, allowing users to fine-tune its behav
 
 *   **`bq_refill_below_ratio`**: (Read/Write) Determines the ratio, in percentage of `global_latency_window`, below which the batch queues should be refilled. Lower values increase the likelihood of refilling batch queues, thus lower latency, at the expense of throughput. The default value is 15. Range should be between 0 and 100.
      
-*   **`batch_size_limit_read`, `batch_size_limit_write`, `batch_size_limit_discard`**: (Read/Write) Configures the maximum batch size for each operation type (Read, Write, Discard). 
+*   **`batch_limit_read`, `batch_limit_write`, `batch_limit_discard`**: (Read/Write) Configures the maximum batch size for each operation type (Read, Write, Discard). 
 
 *   **`lat_target_read`, `lat_target_write`, `lat_target_discard`**: (Read/Write)  Sets the target latency (in nanoseconds) for each operation type.  ADIOS targets to complete corresponding requests within their target latency + predicted latency.
 
 *   **`lat_model_read`, `lat_model_write`, `lat_model_discard`**: (Read-only) Shows the learned latency model parameters (base latency and slope) for the corresponding operation types. The base latency is the constant latency value that is incurred to the I/O completion, and slope represents the latency rate according to I/O request size.
+
+*   **`read_priority`**: (Read/Write) This sets the priority for Read operations relative to other operations with the same deadline.  A higher positive value increases the likelihood of serving Read requests before Write and Discard requests when they share approximately the same deadline. The default value is 5. The range should be between -20 and 19.
 
 *   **`reset_bq_stats`**: (Write-only) Writing `1` to this attribute resets the batch queue statistics, such as the actual high batch sizes, etc.
 
