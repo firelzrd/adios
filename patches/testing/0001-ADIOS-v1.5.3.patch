@@ -1,13 +1,13 @@
-From 3f911e844f4341c305765e3ae93d1f092cc9eff7 Mon Sep 17 00:00:00 2001
+From f5361b067f15e61325e29009eb8465b4257c73da Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 3 Feb 2025 14:27:15 +0900
-Subject: [PATCH] ADIOS v1.5.2R3
+Date: Tue, 4 Feb 2025 19:13:20 +0900
+Subject: [PATCH] ADIOS v1.5.3
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1356 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1373 insertions(+)
+ block/adios.c         | 1352 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1369 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..e130128a83
+index 0000000000..301beb812e
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1356 @@
+@@ -0,0 +1,1352 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -78,7 +78,6 @@ index 0000000000..e130128a83
 +#include <linux/rbtree.h>
 +#include <linux/sbitmap.h>
 +#include <linux/slab.h>
-+#include <linux/list_sort.h>
 +#include <linux/timekeeping.h>
 +
 +#include "elevator.h"
@@ -86,7 +85,7 @@ index 0000000000..e130128a83
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "1.5.2R3"
++#define ADIOS_VERSION "1.5.3"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -98,10 +97,14 @@ index 0000000000..e130128a83
 +};
 +
 +// Global variable to control the latency
-+static u64 default_global_latency_window_nr = 16000000ULL;
-+static u64 default_global_latency_window_r  = 64000000ULL;
++static u64 default_global_latency_window = 16000000ULL;
 +// Ratio below which batch queues should be refilled
 +static u8  default_bq_refill_below_ratio = 15;
++
++// Dynamic thresholds for shrinkage
++static u32 default_lm_shrink_at_kreqs  = 10000;
++static u32 default_lm_shrink_at_gbytes =   100;
++static u32 default_lm_shrink_resist    =     2;
 +
 +// Latency targets for each operation type
 +static u64 default_latency_target[ADIOS_OPTYPES] = {
@@ -130,9 +133,6 @@ index 0000000000..e130128a83
 +#define LM_INTERVAL_THRESHOLD   1500
 +#define LM_OUTLIER_PERCENTILE     99
 +#define LM_LAT_BUCKET_COUNT       64
-+#define LM_SHRINK_AT_MREQ         10
-+#define LM_SHRINK_AT_GBYTES      100
-+#define LM_SHRINK_RESIST           2
 +
 +// Structure to hold latency bucket data for small requests
 +struct latency_bucket_small {
@@ -161,6 +161,10 @@ index 0000000000..e130128a83
 +	spinlock_t buckets_lock;
 +	struct latency_bucket_small small_bucket[LM_LAT_BUCKET_COUNT];
 +	struct latency_bucket_large large_bucket[LM_LAT_BUCKET_COUNT];
++
++	u32 lm_shrink_at_kreqs;
++	u32 lm_shrink_at_gbytes;
++	u8  lm_shrink_resist;
 +};
 +
 +#define ADIOS_BQ_PAGES 2
@@ -183,8 +187,6 @@ index 0000000000..e130128a83
 +	u32 batch_actual_max_total;
 +	u32 async_depth;
 +	u8  bq_refill_below_ratio;
-+
-+	bool optimize_spatial;
 +
 +	u8 bq_page;
 +	bool more_bq_ready;
@@ -229,17 +231,6 @@ index 0000000000..e130128a83
 + /*  10 */       110,        87,        70,        56,        45,
 + /*  15 */        36,        29,        23,        18,        15,
 +};
-+
-+// Comparison function for sorting requests by block address
-+static int cmp_rq_pos(void *priv,
-+		const struct list_head *a, const struct list_head *b) {
-+	struct request *rq_a = list_entry(a, struct request, queuelist);
-+	struct request *rq_b = list_entry(b, struct request, queuelist);
-+	u64 pos_a = blk_rq_pos(rq_a);
-+	u64 pos_b = blk_rq_pos(rq_b);
-+
-+	return (int)(pos_a > pos_b) - (int)(pos_a < pos_b);
-+}
 +
 +// Count the number of entries in small buckets
 +static u32 lm_count_small_entries(struct latency_model *model) {
@@ -293,8 +284,8 @@ index 0000000000..e130128a83
 +	}
 +
 +	// Shrink the model if it reaches at the readjustment threshold
-+	if (model->small_count >= 1000000ULL * LM_SHRINK_AT_MREQ) {
-+		reduction = LM_SHRINK_RESIST;
++	if (model->small_count >= 1000ULL * model->lm_shrink_at_kreqs) {
++		reduction = model->lm_shrink_resist;
 +		if (model->small_count >> reduction) {
 +			model->small_sum_delay -= model->small_sum_delay >> reduction;
 +			model->small_count     -= model->small_count     >> reduction;
@@ -366,8 +357,8 @@ index 0000000000..e130128a83
 +	}
 +
 +	// Shrink the model if it reaches at the readjustment threshold
-+	if (model->large_sum_bsize >= 0x40000000ULL * LM_SHRINK_AT_GBYTES) {
-+		reduction = LM_SHRINK_RESIST;
++	if (model->large_sum_bsize >= 0x40000000ULL * model->lm_shrink_at_gbytes) {
++		reduction = model->lm_shrink_resist;
 +		if (model->large_sum_bsize >> reduction) {
 +			model->large_sum_delay -= model->large_sum_delay >> reduction;
 +			model->large_sum_bsize -= model->large_sum_bsize >> reduction;
@@ -842,7 +833,7 @@ index 0000000000..e130128a83
 +		current_lat += rd->pred_lat;
 +
 +		// Check batch size and total predicted latency
-+		if (count && (!ad->latency_model[optype].base ||
++		if (count && (!ad->latency_model[optype].base || 
 +			ad->batch_count[page][optype] >= ad->batch_limit[optype] ||
 +			current_lat > ad->global_latency_window)) {
 +			break;
@@ -857,13 +848,6 @@ index 0000000000..e130128a83
 +		optype_count[optype]++;
 +		count++;
 +	}
-+
-+	// Sort write requests by block address
-+	if (ad->optimize_spatial)
-+		for (u8 optype = ADIOS_WRITE; optype < ADIOS_OPTYPES; optype++)
-+			if (ad->batch_count[page][optype] > 1)
-+				list_sort(NULL, &ad->batch_queue[page][optype], cmp_rq_pos);
-+
 +	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	if (count) {
@@ -901,8 +885,8 @@ index 0000000000..e130128a83
 +	// Check if there are any requests in the batch queues
 +	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 +		if (!list_empty(&ad->batch_queue[ad->bq_page][i])) {
-+			rq = list_first_entry(
-+				&ad->batch_queue[ad->bq_page][i], struct request, queuelist);
++			rq = list_first_entry(&ad->batch_queue[ad->bq_page][i],
++									struct request, queuelist);
 +			list_del_init(&rq->queuelist);
 +			return rq;
 +		}
@@ -1017,7 +1001,6 @@ index 0000000000..e130128a83
 +	struct adios_data *ad;
 +	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
-+	bool is_rotational;
 +
 +	eq = elevator_alloc(q, e);
 +	if (!eq)
@@ -1047,6 +1030,9 @@ index 0000000000..e130128a83
 +
 +	eq->elevator_data = ad;
 +	
++	ad->global_latency_window = default_global_latency_window;
++	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
++
 +	INIT_LIST_HEAD(&ad->prio_queue);
 +	for (u8 i = 0; i < 2; i++)
 +		ad->dl_tree[i] = RB_ROOT_CACHED;
@@ -1064,6 +1050,9 @@ index 0000000000..e130128a83
 +		memset(model->large_bucket, 0,
 +			sizeof(model->large_bucket[0]) * LM_LAT_BUCKET_COUNT);
 +		model->last_update_jiffies = jiffies;
++		model->lm_shrink_at_kreqs  = default_lm_shrink_at_kreqs;
++		model->lm_shrink_at_gbytes = default_lm_shrink_at_gbytes;
++		model->lm_shrink_resist    = default_lm_shrink_resist;
 +
 +		ad->latency_target[i] = default_latency_target[i];
 +		ad->batch_limit[i] = default_batch_limit[i];
@@ -1074,14 +1063,6 @@ index 0000000000..e130128a83
 +	spin_lock_init(&ad->lock);
 +	spin_lock_init(&ad->pq_lock);
 +	spin_lock_init(&ad->bq_lock);
-+
-+	ad->optimize_spatial = is_rotational =
-+		q->limits.features & BLK_FEAT_ROTATIONAL;
-+
-+	ad->global_latency_window = is_rotational ?
-+		default_global_latency_window_r :
-+		default_global_latency_window_nr;
-+	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 +
 +	/* We dispatch from request queue wide instead of hw queue */
 +	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
@@ -1303,29 +1284,42 @@ index 0000000000..e130128a83
 +	return sprintf(page, "%s\n", ADIOS_VERSION);
 +}
 +
-+// New sysfs attribute for optimize_spatial
-+static ssize_t adios_optimize_spatial_store(
-+		struct elevator_queue *e, const char *page, size_t count) {
-+	struct adios_data *ad = e->elevator_data;
-+	unsigned long val;
-+	int ret;
-+
-+	ret = kstrtoul(page, 10, &val);
-+	if (ret || (val != 0 && val != 1))
-+		return -EINVAL;
-+
-+	guard(spinlock_irqsave)(&ad->lock);
-+
-+	ad->optimize_spatial = !!val;
-+
-+	return count;
++// Define sysfs attributes for dynamic thresholds
++#define SHRINK_THRESHOLD_ATTR_RW(name, model_field, min_value, max_value) \
++static ssize_t adios_shrink_##name##_store( \
++		struct elevator_queue *e, const char *page, size_t count) { \
++	struct adios_data *ad = e->elevator_data; \
++	unsigned long val; \
++	int ret; \
++	ret = kstrtoul(page, 10, &val); \
++	if (ret || val < min_value || val > max_value) \
++		return -EINVAL; \
++	for (u8 i = 0; i < ADIOS_OPTYPES; i++) { \
++		struct latency_model *model = &ad->latency_model[i]; \
++		unsigned long flags; \
++		spin_lock_irqsave(&model->lock, flags); \
++		model->model_field = val; \
++		spin_unlock_irqrestore(&model->lock, flags); \
++	} \
++	return count; \
++} \
++static ssize_t adios_shrink_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	u32 val = 0; \
++	for (u8 i = 0; i < ADIOS_OPTYPES; i++) { \
++		struct latency_model *model = &ad->latency_model[i]; \
++		unsigned long flags; \
++		spin_lock_irqsave(&model->lock, flags); \
++		val = model->model_field; \
++		spin_unlock_irqrestore(&model->lock, flags); \
++	} \
++	return sprintf(page, "%u\n", val); \
 +}
 +
-+static ssize_t adios_optimize_spatial_show(
-+		struct elevator_queue *e, char *page) {
-+	struct adios_data *ad = e->elevator_data;
-+	return sprintf(page, "%d\n", ad->optimize_spatial);
-+}
++SHRINK_THRESHOLD_ATTR_RW(at_kreqs,  lm_shrink_at_kreqs,  1, 100000)
++SHRINK_THRESHOLD_ATTR_RW(at_gbytes, lm_shrink_at_gbytes, 1,   1000)
++SHRINK_THRESHOLD_ATTR_RW(resist,    lm_shrink_resist,    1,      3)
 +
 +// Define sysfs attributes
 +#define AD_ATTR(name, show_func, store_func) \
@@ -1355,13 +1349,15 @@ index 0000000000..e130128a83
 +	AD_ATTR_RW(lat_target_write),
 +	AD_ATTR_RW(lat_target_discard),
 +
++	AD_ATTR_RW(shrink_at_kreqs),
++	AD_ATTR_RW(shrink_at_gbytes),
++	AD_ATTR_RW(shrink_resist),
++
 +	AD_ATTR_RW(read_priority),
 +
 +	AD_ATTR_WO(reset_bq_stats),
 +	AD_ATTR_WO(reset_lat_model),
 +	AD_ATTR(adios_version, adios_version_show, NULL),
-+
-+	AD_ATTR_RW(optimize_spatial),
 +
 +	__ATTR_NULL
 +};
