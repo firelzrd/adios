@@ -1,5 +1,9 @@
 # Adaptive Deadline I/O Scheduler (ADIOS)
 
+## Demo
+
+https://youtu.be/L9WDcEeHgy4
+
 ## Key Features
 
 *   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks.
@@ -55,10 +59,6 @@ ADIOS provides several tunables via sysfs, allowing users to fine-tune its behav
 4.  Load the kernel module: `sudo insmod adios.ko`
 5.  To activate the ADIOS I/O scheduler for a block device, please check your Linux documentation. Usually, it can be done via `echo adios | sudo tee /sys/block/<device_name>/queue/scheduler`
 
-## Current Status
-
-ADIOS is under active development and is considered experimental. Performance and tunables are still under investigation.
-
 ## Future Work
 * More elaborate performance tests and comparison against other schedulers will be conducted.
 * Find better default values for sysfs tunables.
@@ -68,4 +68,3 @@ ADIOS is under active development and is considered experimental. Performance an
 * Piotr Górski a.k.a. "sir_lucjan" from the CachyOS community, for helping me to bust some nasty bug related to bucket-based anomaly sample exclusion algorithm.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y5NHO2I)
-
