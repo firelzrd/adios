@@ -1,17 +1,17 @@
-From f5361b067f15e61325e29009eb8465b4257c73da Mon Sep 17 00:00:00 2001
+From 5241ab32fbe09c7bdd2d7bc3913b8fa5c5b55694 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 4 Feb 2025 19:13:20 +0900
-Subject: [PATCH] ADIOS v1.5.3
+Date: Wed, 2 Apr 2025 04:14:52 +0900
+Subject: [PATCH] ADIOS v1.5.4
 
 ---
  block/Kconfig.iosched |    9 +
  block/Makefile        |    8 +
- block/adios.c         | 1352 +++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 1369 insertions(+)
+ block/adios.c         | 1342 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1359 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
-index 27f11320b8..dd9af8cd7b 100644
+index 27f11320b8..79fd5da5dd 100644
 --- a/block/Kconfig.iosched
 +++ b/block/Kconfig.iosched
 @@ -16,6 +16,15 @@ config MQ_IOSCHED_KYBER
@@ -20,7 +20,7 @@ index 27f11320b8..dd9af8cd7b 100644
  
 +config MQ_IOSCHED_ADIOS
 +	tristate "Adaptive Deadline I/O scheduler"
-+	default y
++	default m
 +	help
 +	  ADIOS is a multi-queue I/O scheduler for the Linux kernel, based on
 +	  mq-deadline and Kyber, with learning-based adaptive latency control.
@@ -55,10 +55,10 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..301beb812e
+index 0000000000..a35fcf6e45
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1352 @@
+@@ -0,0 +1,1342 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The Adaptive Deadline I/O Scheduler (ADIOS)
@@ -85,7 +85,7 @@ index 0000000000..301beb812e
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "1.5.3"
++#define ADIOS_VERSION "1.5.4"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -122,10 +122,7 @@ index 0000000000..301beb812e
 +	[ADIOS_OTHER]   =  1,
 +};
 +
-+static u32 default_dl_prio[2] = {
-+	[0] = 7,
-+	[1] = 0,
-+};
++static u32 default_dl_prio[2] = {7, 0};
 +
 +// Thresholds for latency model control
 +#define LM_BLOCK_SIZE_THRESHOLD 4096
@@ -453,9 +450,7 @@ index 0000000000..301beb812e
 +
 +	if (block_size <= LM_BLOCK_SIZE_THRESHOLD) {
 +		// Handle small requests
-+
-+		bucket_index =
-+			lm_input_bucket_index(model, latency, (model->base ?: 1));
++		bucket_index = lm_input_bucket_index(model, latency, model->base ?: 1);
 +
 +		if (bucket_index >= LM_LAT_BUCKET_COUNT)
 +			bucket_index = LM_LAT_BUCKET_COUNT - 1;
@@ -475,8 +470,7 @@ index 0000000000..301beb812e
 +			return;
 +		}
 +
-+		bucket_index =
-+			lm_input_bucket_index(model, latency, pred_lat);
++		bucket_index = lm_input_bucket_index(model, latency, pred_lat);
 +
 +		if (bucket_index >= LM_LAT_BUCKET_COUNT)
 +			bucket_index = LM_LAT_BUCKET_COUNT - 1;
@@ -505,8 +499,7 @@ index 0000000000..301beb812e
 +
 +// Determine the type of operation based on request flags
 +static u8 adios_optype(struct request *rq) {
-+	blk_opf_t opf = rq->cmd_flags;
-+	switch (opf & REQ_OP_MASK) {
++	switch (rq->cmd_flags & REQ_OP_MASK) {
 +	case REQ_OP_READ:
 +		return ADIOS_READ;
 +	case REQ_OP_WRITE:
@@ -524,7 +517,7 @@ index 0000000000..301beb812e
 +
 +// Helper function to retrieve adios_rq_data from a request
 +static inline struct adios_rq_data *get_rq_data(struct request *rq) {
-+	return (struct adios_rq_data *)rq->elv.priv[0];
++	return rq->elv.priv[0];
 +}
 +
 +// Add a request to the deadline-sorted red-black tree
@@ -753,10 +746,8 @@ index 0000000000..301beb812e
 +	struct rb_root_cached *root = &ad->dl_tree[idx];
 +	struct rb_node *first = rb_first_cached(root);
 +	struct dl_group *dl_group = rb_entry(first, struct dl_group, node);
-+	struct adios_rq_data *rd =
-+		list_first_entry(&dl_group->rqs, struct adios_rq_data, dl_node);
 +
-+	return rd;
++	return list_first_entry(&dl_group->rqs, struct adios_rq_data, dl_node);
 +}
 +
 +// Select the next request to dispatch from the deadline-sorted red-black tree
@@ -816,8 +807,7 @@ index 0000000000..301beb812e
 +static bool fill_batch_queues(struct adios_data *ad, u64 current_lat) {
 +	unsigned long flags;
 +	u32 count = 0;
-+	u32 optype_count[ADIOS_OPTYPES];
-+	memset(optype_count, 0, sizeof(optype_count));
++	u32 optype_count[ADIOS_OPTYPES] = {0};
 +	u8 page = (ad->bq_page + 1) % ADIOS_BQ_PAGES;
 +
 +	reset_batch_counts(ad, page);
@@ -1029,7 +1019,7 @@ index 0000000000..301beb812e
 +	}
 +
 +	eq->elevator_data = ad;
-+	
++
 +	ad->global_latency_window = default_global_latency_window;
 +	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 +
