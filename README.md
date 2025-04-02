@@ -1,31 +1,40 @@
 # Adaptive Deadline I/O Scheduler (ADIOS)
 
+## Overview
+
+ADIOS (Adaptive Deadline I/O Scheduler) is a block layer I/O scheduler for the Linux kernel, designed for modern multi-queue block devices (`blk-mq`). It aims to provide low latency for I/O operations by combining deadline scheduling principles with a learning-based adaptive latency control mechanism.
+
+ADIOS is inspired by and builds upon concepts from the `mq-deadline` and `Kyber` I/O schedulers. Its core feature is the ability to predict I/O completion latency based on past performance and request characteristics (operation type, size) and use this prediction to dynamically adjust request deadlines and batching behavior.
+
 ## Demo
 
 https://youtu.be/L9WDcEeHgy4
 
 ## Key Features
 
-*   **Optimized for Desktop Workloads:** ADIOS is particularly well-suited for desktop environments where users expect a smooth and responsive experience, even when running I/O-intensive tasks.
-
-*   **Optimized for Non-Rotational Devices:** ADIOS is primarily designed and optimized for non-rotational storage devices such as Solid State Drives (SSDs), NVMe drives, USB thumb drives, SD cards and so on. While it might function on rotational drives, performance characteristics on those devices are not a primary focus.
-
 *   **Adaptive Latency Control:** ADIOS continuously learns the latency profile of the storage device by monitoring the actual completion times of I/O requests. This learned profile is used to predict the completion time for subsequent requests, allowing it to adapt to varying I/O characteristics.
 
 *   **Dynamic Deadline Adjustment:** Using the learned latency profile, ADIOS dynamically adjusts the deadline for each I/O request. It packs as many I/O requests as possible within a configurable global latency window, maximizing the benefits of batching while maintaining responsiveness.
 
-*   **Double-Buffering Batch Queues:** ADIOS employs a double-buffering technique for its batch queues, allowing it to fill one queue while dispatching requests from the other. This helps to avoid dispatch stalls and keep the underlying storage devices busy.
+*   **Request Batching:** ADIOS groups requests into batches before dispatching to the hardware, aiming to improve efficiency while staying within a configurable global latency window.
     
-*   **Latency Model Shrinking**: The latency model's statistics are periodically reduced to prevent the model from being overly influenced by outdated or irrelevant data. This keeps the model's memory footprint small while maintaining its accuracy.
+*   **Dynamic Model Updates:** Continuously refines latency predictions based on the actual completion times of recent requests.
 
-*   **Derived from mq-deadline and Kyber:** ADIOS draws inspiration from `mq-deadline` and `Kyber` but represents a new design and implementation, incorporating and improving upon key concepts from these existing schedulers. It is **NOT** a direct derivative of either of them.
+*   **Model Shrinkage:** Periodically reduces the weight of older samples in the latency model to adapt to changing device performance characteristics.
+
+*   **Sysfs Tunability:** Provides various sysfs knobs to configure latency targets, batch limits, model behavior, and other parameters.
 
 ## How it Works
+![alt adios-depicted](https://github.com/user-attachments/assets/1de83e36-31e2-4a72-bca8-efa39cf6747f)
 
-1.  **Latency Learning:** ADIOS monitors the completion time of each I/O request. It tracks the latency of different operation types and block sizes to build a parametric model of the storage device's performance.
-2.  **Latency Prediction:** The learned latency profile is used to predict the time required to complete each incoming I/O request.
-3.  **Adaptive Deadline Setting:** The predicted latency, along with the pre-defined target latency for the operation type, is used to set a deadline for each request.
-4.  **Batching and Dispatch:** ADIOS attempts to dispatch as many I/O requests as possible within a global latency window, while also prioritizing synchronous operations and using double-buffered queues. This helps to improve overall throughput without sacrificing much responsiveness.
+1.  **Request Arrival:** When a new I/O request arrives, ADIOS determines its type (Read, Write, Discard, Other) and size.
+2.  **Latency Prediction:** It queries the corresponding `latency_model` to predict how long this specific request is expected to take based on historical data (`latency_model_predict`).
+3.  **Deadline Calculation:** A deadline is calculated for the request using: `request_start_time + target_latency[optype] + predicted_latency`.
+4.  **Insertion:** The request is inserted into one of two deadline-sorted red-black trees (one primarily for reads, one for writes/discards) based on its calculated deadline.
+5.  **Batch Queue Filling:** Periodically, or when the current batch queues are running low (`bq_refill_below_ratio`), ADIOS pulls requests with the earliest deadlines from the red-black trees (`fill_batch_queues`). It attempts to fill batches up to a `global_latency_window` based on the *predicted* latency of the requests being batched, respecting per-operation type `batch_limit`s.
+6.  **Dispatch:** Requests are dispatched to the hardware primarily from these batch queues (`dispatch_from_bq`). A separate priority queue (`prio_queue`) handles requests inserted at the head (e.g., for request merging).
+7.  **Completion & Learning:** When a request completes, its actual completion latency (`completion_time - io_start_time`) is measured. This measured latency, along with the request size and its predicted latency, is fed back into the `latency_model` (`latency_model_input`, `latency_model_update`). This allows the scheduler to learn and adapt its predictions over time. The model uses buckets to handle outliers and performs periodic updates.
+8.  **Bias Adjustment:** A bias factor (`dl_bias`) is adjusted based on which queue (read-mostly vs. write-mostly) requests are dispatched from, influenced by the `read_priority` setting. This helps enforce the desired priority between reads and writes when deadlines are close.
 
 ## Sysfs Tunables
 
