@@ -1,7 +1,7 @@
-From 5241ab32fbe09c7bdd2d7bc3913b8fa5c5b55694 Mon Sep 17 00:00:00 2001
+From 7f9ff589274eebab4304a8b5e88a2a3d6440e106 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 2 Apr 2025 04:14:52 +0900
-Subject: [PATCH] ADIOS v1.5.4
+Date: Tue, 29 Apr 2025 22:27:43 +0900
+Subject: [PATCH] ADIOS v1.5.5
 
 ---
  block/Kconfig.iosched |    9 +
@@ -55,7 +55,7 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..a35fcf6e45
+index 0000000000..3e66b26b51
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1342 @@
@@ -85,7 +85,7 @@ index 0000000000..a35fcf6e45
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "1.5.4"
++#define ADIOS_VERSION "1.5.5"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -274,7 +274,7 @@ index 0000000000..a35fcf6e45
 +				threshold_count - (cumulative_count - bucket->count);
 +			if (bucket->count > 0) {
 +				sum_latency +=
-+					(bucket->sum_latency * remaining_count) / bucket->count;
++					div_u64((bucket->sum_latency * remaining_count), bucket->count);
 +				sum_count += remaining_count;
 +			}
 +		}
@@ -346,9 +346,9 @@ index 0000000000..a35fcf6e45
 +				threshold_count - (cumulative_count - bucket->count);
 +			if (bucket->count > 0) {
 +				sum_latency +=
-+					(bucket->sum_latency * remaining_count) / bucket->count;
++					div_u64((bucket->sum_latency * remaining_count), bucket->count);
 +				sum_block_size +=
-+					(bucket->sum_block_size * remaining_count) / bucket->count;
++					div_u64((bucket->sum_block_size * remaining_count), bucket->count);
 +			}
 +		}
 +	}
@@ -431,11 +431,11 @@ index 0000000000..a35fcf6e45
 +	u8 bucket_index;
 +
 +	if (measured < predicted * 2)
-+		bucket_index = (measured * 20) / predicted;
++		bucket_index = div_u64((measured * 20), predicted);
 +	else if (measured < predicted * 5)
-+		bucket_index = (measured * 10) / predicted + 20;
++		bucket_index = div_u64((measured * 10), predicted) + 20;
 +	else
-+		bucket_index = (measured * 3) / predicted + 40;
++		bucket_index = div_u64((measured * 3), predicted) + 40;
 +
 +	return bucket_index;
 +}
@@ -868,7 +868,7 @@ index 0000000000..a35fcf6e45
 +	tpl = atomic64_read(&ad->total_pred_lat);
 +
 +	if (!ad->more_bq_ready && (!tpl ||
-+			tpl < ad->global_latency_window * ad->bq_refill_below_ratio / 100))
++			tpl < div_u64(ad->global_latency_window * ad->bq_refill_below_ratio, 100) ))
 +		fill_batch_queues(ad, tpl);
 +
 +again:
