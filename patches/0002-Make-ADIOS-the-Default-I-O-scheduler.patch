@@ -1,0 +1,34 @@
+From a614b261671f4e459d82e20d2dc54d6d3f46c3a2 Mon Sep 17 00:00:00 2001
+From: Masahito S <firelzrd@gmail.com>
+Date: Fri, 9 May 2025 15:51:43 +0900
+Subject: [PATCH] Make ADIOS the Default I/O scheduler
+
+---
+ block/Kconfig.iosched | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
+index e98585dd83..dcbcf7c8a3 100644
+--- a/block/Kconfig.iosched
++++ b/block/Kconfig.iosched
+@@ -18,7 +18,7 @@ config MQ_IOSCHED_KYBER
+ 
+ config MQ_IOSCHED_ADIOS
+ 	tristate "Adaptive Deadline I/O scheduler"
+-	default m
++	default y
+ 	help
+ 	  The Adaptive Deadline I/O Scheduler (ADIOS) is a multi-queue I/O
+ 	  scheduler with learning-based adaptive latency control.
+@@ -26,7 +26,7 @@ config MQ_IOSCHED_ADIOS
+ config MQ_IOSCHED_DEFAULT_ADIOS
+ 	bool "Enable ADIOS I/O scheduler as default MQ I/O scheduler"
+ 	depends on MQ_IOSCHED_ADIOS=y
+-	default n
++	default y
+ 	help
+ 	  Enable the ADIOS I/O scheduler as the default scheduler for MQ I/O.
+ 
+-- 
+2.34.1
+
