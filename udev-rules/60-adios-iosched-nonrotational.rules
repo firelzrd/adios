@@ -1,0 +1,5 @@
+# /etc/udev/rules.d/60-adios-iosched-nonrotational.rules
+
+# For non-rotational, non-virtual devices
+ACTION=="add", SUBSYSTEM=="block", KERNEL!="loop*", KERNEL!="zram*", ATTR{queue/rotational}=="0", RUN+="/bin/sh -c 'modprobe -b adios; echo adios > /sys$DEVPATH/queue/scheduler'"
+
