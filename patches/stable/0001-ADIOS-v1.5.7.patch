@@ -1,14 +1,14 @@
-From 329ebd92eedc00ad5efe6e05db9e42c2c8f92f25 Mon Sep 17 00:00:00 2001
+From d2e1765fd0cc6019d99f5943a6abc31f584679e6 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 9 May 2025 15:30:22 +0900
-Subject: [PATCH] ADIOS v1.5.6
+Date: Tue, 13 May 2025 03:05:07 +0900
+Subject: [PATCH] ADIOS v1.5.7
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
  block/adios.c         | 1339 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |    4 +
- 4 files changed, 1365 insertions(+)
+ block/elevator.c      |    5 +
+ 4 files changed, 1366 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,7 +37,7 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index ddfd21c1a9..ebe14e94d1 100644
+index 3374812371..a67f651a78 100644
 --- a/block/Makefile
 +++ b/block/Makefile
 @@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
@@ -48,7 +48,7 @@ index ddfd21c1a9..ebe14e94d1 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -38,3 +39,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,7 +61,7 @@ index ddfd21c1a9..ebe14e94d1 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..28de7cb005
+index 0000000000..9393ebfe6c
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1339 @@
@@ -88,7 +88,7 @@ index 0000000000..28de7cb005
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "1.5.6"
++#define ADIOS_VERSION "1.5.7"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -1406,16 +1406,21 @@ index 0000000000..28de7cb005
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index 43ba4ab1ad..3810e40aa1 100644
+index cd2ce49216..7c6ff2c47c 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -568,7 +568,11 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
- 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+ 	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return NULL;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +	return elevator_find_get("adios");
 +#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++
+ 	if (q->nr_hw_queues != 1 &&
+ 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+ 		return NULL;
+ 
  	return elevator_find_get("mq-deadline");
 +#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
  }
