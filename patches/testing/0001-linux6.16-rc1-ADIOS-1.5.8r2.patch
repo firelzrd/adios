@@ -1,14 +1,14 @@
-From 1a05e02e9f28f0bb05c7432997eb17cb5789870d Mon Sep 17 00:00:00 2001
+From cef1a02e8a42dab92a7f226ed58d8a39aa9a6ffa Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 20 May 2025 17:36:57 +0900
+Date: Mon, 9 Jun 2025 22:49:41 +0900
 Subject: [PATCH] linux6.16-rc1-ADIOS-1.5.8
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
  block/adios.c         | 1344 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |    4 +
- 4 files changed, 1370 insertions(+)
+ block/elevator.c      |   10 +-
+ 4 files changed, 1374 insertions(+), 2 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,7 +61,7 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..f008d28cd0
+index 0000000000..8d30169d16
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1344 @@
@@ -925,7 +925,7 @@ index 0000000000..f008d28cd0
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = from_timer(ad, t, update_timer);
++	struct adios_data *ad = timer_container_of(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(&ad->latency_model[optype]);
@@ -1411,21 +1411,31 @@ index 0000000000..f008d28cd0
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index ab22542e6c..b3b84170f0 100644
+index ab22542e6c..62a4ec42ab 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -716,7 +716,11 @@ void elv_update_nr_hw_queues(struct request_queue *q)
- void elevator_set_default(struct request_queue *q)
- {
- 	struct elv_change_ctx ctx = {
+@@ -727,13 +727,19 @@ void elevator_set_default(struct request_queue *q)
+ 	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
+ 		return;
+ 
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+		.name = "adios",
-+#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
- 		.name = "mq-deadline",
++	ctx.name = "adios";
++	goto found;
 +#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
- 		.no_uevent = true,
- 	};
- 	int err = 0;
++
+ 	/*
+ 	 * For single queue devices, default to using mq-deadline. If we
+ 	 * have multiple queues or mq-deadline is not available, default
+ 	 * to "none".
+ 	 */
+-	if (elevator_find_get(ctx.name) && (q->nr_hw_queues == 1 ||
+-			 blk_mq_is_shared_tags(q->tag_set->flags)))
++	if (q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags))
++found:
++	if (elevator_find_get(ctx.name))
+ 		err = elevator_change(q, &ctx);
+ 	if (err < 0)
+ 		pr_warn("\"%s\" elevator initialization, failed %d, "
 -- 
 2.34.1
 
