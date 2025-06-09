@@ -1,7 +1,7 @@
-From fb49acaf5c481edc2ff67533cd7bc25af50ec46c Mon Sep 17 00:00:00 2001
+From 23dcbd6edd7f9058dce3576ef8718ab163542a6d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Tue, 20 May 2025 17:36:57 +0900
-Subject: [PATCH] ADIOS v1.5.8
+Subject: [PATCH] linux6.15.0-ADIOS-1.5.8
 
 ---
  block/Kconfig.iosched |   14 +
@@ -37,7 +37,7 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index ddfd21c1a9..ebe14e94d1 100644
+index 3a941dc0d2..94e3bf608b 100644
 --- a/block/Makefile
 +++ b/block/Makefile
 @@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
@@ -48,7 +48,7 @@ index ddfd21c1a9..ebe14e94d1 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -38,3 +39,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -1411,10 +1411,10 @@ index 0000000000..f008d28cd0
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index 43ba4ab1ad..6a8b4c0a1f 100644
+index b4d08026b0..2613213992 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -564,11 +564,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return NULL;
  
