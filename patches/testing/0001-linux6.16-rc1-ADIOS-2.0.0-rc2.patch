@@ -1,14 +1,14 @@
-From d3355609af8fca07afbb56de4fa55845ffced497 Mon Sep 17 00:00:00 2001
+From 1afcc10cc2a0f715a05e2f1f5d463f6431b95cda Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Fri, 13 Jun 2025 02:03:32 +0900
-Subject: [PATCH] linux6.16-rc1-ADIOS-2.0.0-rc1
+Date: Sat, 14 Jun 2025 03:30:19 +0900
+Subject: [PATCH] linux6.16-rc1-ADIOS-2.0.0-rc2
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1384 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1379 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   10 +-
- 4 files changed, 1414 insertions(+), 2 deletions(-)
+ 4 files changed, 1409 insertions(+), 2 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..47a32ec263
+index 0000000000..8cca6b8382
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1379 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -89,7 +89,7 @@ index 0000000000..47a32ec263
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.0.0-rc1"
++#define ADIOS_VERSION "2.0.0-rc2"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -391,11 +391,12 @@ index 0000000000..47a32ec263
 +	bool time_elapsed;
 +	bool small_processed = false, large_processed = false;
 +	struct per_cpu_lm_buckets *aggr = ad->aggr_buckets;
++	unsigned long flags;
 +	int cpu;
 +
 +	memset(aggr, 0, sizeof(*aggr));
 +
-+	write_seqlock_bh(&model->lock);
++	write_seqlock_irqsave(&model->lock, flags);
 +
 +	// Aggregate data from all CPUs and reset per-cpu buckets.
 +	for_each_possible_cpu(cpu) {
@@ -449,7 +450,7 @@ index 0000000000..47a32ec263
 +	if (time_elapsed)
 +		model->last_update_jiffies = now;
 +
-+	write_sequnlock_bh(&model->lock);
++	write_sequnlock_irqrestore(&model->lock, flags);
 +}
 +
 +// Determine the bucket index for a given measured and predicted latency
@@ -472,7 +473,6 @@ index 0000000000..47a32ec263
 +	u8 bucket_index;
 +	struct per_cpu_lm_buckets *buckets;
 +
-+	preempt_disable();
 +	buckets = this_cpu_ptr(model->pcpu_buckets);
 +
 +	if (block_size <= LM_BLOCK_SIZE_THRESHOLD) {
@@ -486,16 +486,13 @@ index 0000000000..47a32ec263
 +		buckets->small_bucket[bucket_index].sum_latency += latency;
 +
 +		if (unlikely(!model->base)) {
-+			preempt_enable();
 +			latency_model_update(ad, model);
 +			return;
 +		}
 +	} else {
 +		// Handle large requests
-+		if (!model->base || !pred_lat) {
-+			preempt_enable();
++		if (!model->base || !pred_lat)
 +			return;
-+		}
 +
 +		bucket_index = lm_input_bucket_index(latency, pred_lat);
 +
@@ -506,8 +503,6 @@ index 0000000000..47a32ec263
 +		buckets->large_bucket[bucket_index].sum_latency += latency;
 +		buckets->large_bucket[bucket_index].sum_block_size += block_size;
 +	}
-+
-+	preempt_enable();
 +}
 +
 +// Predict the latency for a given block size using the latency model
@@ -695,7 +690,7 @@ index 0000000000..47a32ec263
 +	struct request *free = NULL;
 +	bool ret;
 +
-+	scoped_guard(spinlock_bh, &ad->lock)
++	scoped_guard(spinlock_irqsave, &ad->lock)
 +		ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
 +
 +	if (free)
@@ -712,12 +707,12 @@ index 0000000000..47a32ec263
 +	struct adios_data *ad = q->elevator->elevator_data;
 +
 +	if (insert_flags & BLK_MQ_INSERT_AT_HEAD) {
-+		scoped_guard(spinlock_bh, &ad->pq_lock)
++		scoped_guard(spinlock_irqsave, &ad->pq_lock)
 +			list_add_tail(&rq->queuelist, &ad->prio_queue);
 +		return;
 +	}
 +
-+	guard(spinlock_bh)(&ad->lock);
++	guard(spinlock_irqsave)(&ad->lock);
 +
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
 +		return;
@@ -833,7 +828,7 @@ index 0000000000..47a32ec263
 +
 +	reset_batch_counts(ad, page);
 +
-+	scoped_guard(spinlock_bh, &ad->lock)
++	scoped_guard(spinlock_irqsave, &ad->lock)
 +		while (true) {
 +			struct request *rq = next_request(ad);
 +			if (!rq)
@@ -883,7 +878,7 @@ index 0000000000..47a32ec263
 +	struct request *rq = NULL;
 +	u64 tpl;
 +
-+	guard(spinlock_bh)(&ad->bq_lock);
++	guard(spinlock_irqsave)(&ad->bq_lock);
 +
 +	tpl = atomic64_read(&ad->total_pred_lat);
 +
@@ -915,7 +910,7 @@ index 0000000000..47a32ec263
 +static struct request *dispatch_from_pq(struct adios_data *ad) {
 +	struct request *rq = NULL;
 +
-+	guard(spinlock_bh)(&ad->pq_lock);
++	guard(spinlock_irqsave)(&ad->pq_lock);
 +
 +	if (!list_empty(&ad->prio_queue)) {
 +		rq = list_first_entry(&ad->prio_queue, struct request, queuelist);
@@ -974,12 +969,12 @@ index 0000000000..47a32ec263
 +}
 +
 +static inline bool pq_has_work(struct adios_data *ad) {
-+	guard(spinlock_bh)(&ad->pq_lock);
++	guard(spinlock_irqsave)(&ad->pq_lock);
 +	return !list_empty(&ad->prio_queue);
 +}
 +
 +static inline bool bq_has_work(struct adios_data *ad) {
-+	guard(spinlock_bh)(&ad->bq_lock);
++	guard(spinlock_irqsave)(&ad->bq_lock);
 +
 +	for (u8 i = 0; i < ADIOS_OPTYPES; i++)
 +		if (!list_empty(&ad->batch_queue[ad->bq_page][i]))
@@ -989,7 +984,7 @@ index 0000000000..47a32ec263
 +}
 +
 +static inline bool dl_tree_has_work(struct adios_data *ad) {
-+	guard(spinlock_bh)(&ad->lock);
++	guard(spinlock_irqsave)(&ad->lock);
 +	return ad->dl_queued;
 +}
 +
@@ -1269,7 +1264,7 @@ index 0000000000..47a32ec263
 +	if (ret || prio < -20 || prio > 19)
 +		return -EINVAL;
 +
-+	guard(spinlock_bh)(&ad->lock);
++	guard(spinlock_irqsave)(&ad->lock);
 +	ad->dl_prio[0] = prio;
 +	ad->dl_bias = 0;
 +
