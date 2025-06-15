@@ -1,14 +1,14 @@
-From 1afcc10cc2a0f715a05e2f1f5d463f6431b95cda Mon Sep 17 00:00:00 2001
+From 02a6daabf1588d3c21a7b2fb28b2ad98cfbb1c8d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 14 Jun 2025 03:30:19 +0900
-Subject: [PATCH] linux6.16-rc1-ADIOS-2.0.0-rc2
+Date: Sun, 15 Jun 2025 21:00:09 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.0.0-rc3
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1379 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |   10 +-
- 4 files changed, 1409 insertions(+), 2 deletions(-)
+ block/adios.c         | 1377 +++++++++++++++++++++++++++++++++++++++++
+ block/elevator.c      |    5 +
+ 4 files changed, 1404 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,10 +37,10 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index c65f4da937..105b12fd86 100644
+index 3a941dc0d2..94e3bf608b 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -22,6 +22,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
@@ -48,7 +48,7 @@ index c65f4da937..105b12fd86 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..8cca6b8382
+index 0000000000..ce341c9ea2
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1379 @@
+@@ -0,0 +1,1377 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -89,7 +89,7 @@ index 0000000000..8cca6b8382
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.0.0-rc2"
++#define ADIOS_VERSION "2.0.0-rc3"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -665,11 +665,9 @@ index 0000000000..8cca6b8382
 +	bool dl_idx = adios_optype_not_read(req);
 +	struct adios_data *ad = q->elevator->elevator_data;
 +
-+	// if the merge was a front merge, we need to reposition request
-+	if (type == ELEVATOR_FRONT_MERGE) {
-+		del_from_dl_tree(ad, dl_idx, req);
-+		add_to_dl_tree(ad, dl_idx, req);
-+	}
++	// Reposition request in the deadline-sorted tree
++	del_from_dl_tree(ad, dl_idx, req);
++	add_to_dl_tree(ad, dl_idx, req);
 +}
 +
 +// Handle merging of requests after one has been merged into another
@@ -935,7 +933,7 @@ index 0000000000..8cca6b8382
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = timer_container_of(ad, t, update_timer);
++	struct adios_data *ad = from_timer(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(ad, &ad->latency_model[optype]);
@@ -1446,31 +1444,26 @@ index 0000000000..8cca6b8382
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index ab22542e6c..62a4ec42ab 100644
+index b4d08026b0..2613213992 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -727,13 +727,19 @@ void elevator_set_default(struct request_queue *q)
+@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return;
+ 		return NULL;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	ctx.name = "adios";
-+	goto found;
-+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++	return elevator_find_get("adios");
++#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +
- 	/*
- 	 * For single queue devices, default to using mq-deadline. If we
- 	 * have multiple queues or mq-deadline is not available, default
- 	 * to "none".
- 	 */
--	if (elevator_find_get(ctx.name) && (q->nr_hw_queues == 1 ||
--			 blk_mq_is_shared_tags(q->tag_set->flags)))
-+	if (q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags))
-+found:
-+	if (elevator_find_get(ctx.name))
- 		err = elevator_change(q, &ctx);
- 	if (err < 0)
- 		pr_warn("\"%s\" elevator initialization, failed %d, "
+ 	if (q->nr_hw_queues != 1 &&
+ 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+ 		return NULL;
+ 
+ 	return elevator_find_get("mq-deadline");
++#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+ }
+ 
+ /*
 -- 
 2.34.1
 
