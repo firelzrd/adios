@@ -1,14 +1,14 @@
-From db21ea2b093cd57d2175142a00bb48fabacbb7db Mon Sep 17 00:00:00 2001
+From 59b728e9f244396b46697961a777f2a19a48e2c7 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 29 Jun 2025 02:42:02 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-2.1.0
+Date: Sun, 29 Jun 2025 11:42:22 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.1.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1359 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1368 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |    5 +
- 4 files changed, 1386 insertions(+)
+ 4 files changed, 1395 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..7e48662ba7
+index 0000000000..febcbe5423
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1359 @@
+@@ -0,0 +1,1368 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -89,7 +89,7 @@ index 0000000000..7e48662ba7
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.1.0"
++#define ADIOS_VERSION "2.1.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -174,6 +174,7 @@ index 0000000000..7e48662ba7
 +};
 +
 +#define ADIOS_BQ_PAGES 2
++#define ADIOS_MAX_INSERTS_PER_LOCK 16
 +
 +// Adios scheduler data
 +struct adios_data {
@@ -715,8 +716,6 @@ index 0000000000..7e48662ba7
 +		return;
 +	}
 +
-+	guard(spinlock_irqsave)(&ad->lock);
-+
 +	if (blk_mq_sched_try_insert_merge(q, rq, free))
 +		return;
 +
@@ -733,14 +732,24 @@ index 0000000000..7e48662ba7
 +static void adios_insert_requests(struct blk_mq_hw_ctx *hctx,
 +				   struct list_head *list,
 +				   blk_insert_t insert_flags) {
++	struct request_queue *q = hctx->queue;
++	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *rq;
++	bool stop = false;
 +	LIST_HEAD(free);
 +
-+	while (!list_empty(list)) {
-+		rq = list_first_entry(list, struct request, queuelist);
-+		list_del_init(&rq->queuelist);
-+		insert_request(hctx, rq, insert_flags, &free);
-+	}
++	do {
++	scoped_guard(spinlock_irqsave, &ad->lock)
++		for (int i = 0; i < ADIOS_MAX_INSERTS_PER_LOCK; i++) {
++			if (list_empty(list)) {
++				stop = true;
++				break;
++			}
++			rq = list_first_entry(list, struct request, queuelist);
++			list_del_init(&rq->queuelist);
++			insert_request(hctx, rq, insert_flags, &free);
++		}
++	} while (!stop);
 +
 +	blk_mq_free_requests(&free);
 +}
