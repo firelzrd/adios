@@ -1,7 +1,7 @@
-From 64edc1c71a8decef8d43139f774f690d2c5f5dd5 Mon Sep 17 00:00:00 2001
+From f8e15774869c3b8842dcca7ae9b0cee281075a18 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 7 Jul 2025 06:15:47 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-2.2.4
+Date: Mon, 7 Jul 2025 15:53:21 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.2.5
 
 ---
  block/Kconfig.iosched |   14 +
@@ -61,7 +61,7 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..3d29a278b2
+index 0000000000..80020021c4
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1448 @@
@@ -90,7 +90,7 @@ index 0000000000..3d29a278b2
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.2.4"
++#define ADIOS_VERSION "2.2.5"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -1009,7 +1009,7 @@ index 0000000000..3d29a278b2
 +	struct adios_data *ad;
 +	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
-+	int cpu = 0;
++	u8 optype = 0;
 +
 +	eq = elevator_alloc(q, e);
 +	if (!eq)
@@ -1056,7 +1056,7 @@ index 0000000000..3d29a278b2
 +		goto destroy_dl_group_pool;
 +	}
 +
-+	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++) {
++	for (optype = 0; optype < ADIOS_OPTYPES; optype++) {
 +		struct latency_model *model = &ad->latency_model[optype];
 +		seqlock_init(&model->lock);
 +
@@ -1093,8 +1093,8 @@ index 0000000000..3d29a278b2
 +
 +free_buckets:
 +	pr_err("adios: Failed to allocate per-cpu buckets\n");
-+	while (--cpu >= 0) {
-+		struct latency_model *prev_model = &ad->latency_model[cpu];
++	while (--optype >= 0) {
++		struct latency_model *prev_model = &ad->latency_model[optype];
 +		free_percpu(prev_model->pcpu_buckets);
 +	}
 +	kfree(ad->aggr_buckets);
