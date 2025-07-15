@@ -1,14 +1,14 @@
-From f8e15774869c3b8842dcca7ae9b0cee281075a18 Mon Sep 17 00:00:00 2001
+From 1e32dedd08e3c8f09610a2e0ebb28911df5785d8 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 7 Jul 2025 15:53:21 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-2.2.5
+Date: Wed, 16 Jul 2025 03:12:53 +0900
+Subject: [PATCH] linux6.16-rc1-ADIOS-2.3.0
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1448 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |    5 +
- 4 files changed, 1475 insertions(+)
+ block/adios.c         | 1450 +++++++++++++++++++++++++++++++++++++++++
+ block/elevator.c      |   10 +-
+ 4 files changed, 1480 insertions(+), 2 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,10 +37,10 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index 3a941dc0d2..94e3bf608b 100644
+index c65f4da937..105b12fd86 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -22,6 +22,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
@@ -48,7 +48,7 @@ index 3a941dc0d2..94e3bf608b 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,10 +61,10 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..80020021c4
+index 0000000000..a6cf99b0a3
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1448 @@
+@@ -0,0 +1,1450 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..80020021c4
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.2.5"
++#define ADIOS_VERSION "2.3.0"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -408,8 +408,6 @@ index 0000000000..80020021c4
 +	unsigned long flags;
 +	int cpu;
 +
-+	reset_buckets(ad->aggr_buckets);
-+
 +	write_seqlock_irqsave(&model->lock, flags);
 +
 +	// Aggregate data from all CPUs and reset per-cpu buckets.
@@ -433,25 +431,29 @@ index 0000000000..80020021c4
 +		reset_buckets(pcpu_b);
 +	}
 +
++	// Count the number of entries in aggregated buckets
++	small_count = lm_count_small_entries(aggr->small_bucket);
++	large_count = lm_count_large_entries(aggr->large_bucket);
++
 +	// Whether enough time has elapsed since the last update
 +	now = jiffies;
 +	time_elapsed = unlikely(!model->base) || model->last_update_jiffies +
 +		msecs_to_jiffies(LM_INTERVAL_THRESHOLD) <= now;
 +
-+	// Count the number of entries in aggregated buckets
-+	small_count = lm_count_small_entries(aggr->small_bucket);
-+	large_count = lm_count_large_entries(aggr->large_bucket);
-+
 +	// Update small buckets
 +	if (small_count && (time_elapsed ||
-+			LM_SAMPLES_THRESHOLD <= small_count || !model->base))
++			LM_SAMPLES_THRESHOLD <= small_count || !model->base)) {
 +		small_processed = lm_update_small_buckets(
 +			model, aggr->small_bucket, small_count, !model->base);
++		memset(&aggr->small_bucket[0], 0, sizeof(aggr->small_bucket));
++	}
 +	// Update large buckets
 +	if (large_count && (time_elapsed ||
-+			LM_SAMPLES_THRESHOLD <= large_count || !model->slope))
++			LM_SAMPLES_THRESHOLD <= large_count || !model->slope)) {
 +		large_processed = lm_update_large_buckets(
 +			model, aggr->large_bucket, large_count, !model->slope);
++		memset(&aggr->large_bucket[0], 0, sizeof(aggr->large_bucket));
++	}
 +
 +	// Update the base parameter if small bucket was processed
 +	if (small_processed && likely(model->small_count))
@@ -462,8 +464,8 @@ index 0000000000..80020021c4
 +		model->slope = div_u64(model->large_sum_delay,
 +			DIV_ROUND_UP_ULL(model->large_sum_bsize, 1024));
 +
-+	// Reset statistics and update last updated jiffies if time has elapsed
-+	if (time_elapsed)
++	// Update last updated jiffies if update happened or time has elapsed
++	if (small_processed || large_processed || time_elapsed)
 +		model->last_update_jiffies = now;
 +
 +	write_sequnlock_irqrestore(&model->lock, flags);
@@ -938,7 +940,7 @@ index 0000000000..80020021c4
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = from_timer(ad, t, update_timer);
++	struct adios_data *ad = timer_container_of(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(ad, &ad->latency_model[optype]);
@@ -1515,26 +1517,31 @@ index 0000000000..80020021c4
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index b4d08026b0..2613213992 100644
+index ab22542e6c..62a4ec42ab 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+@@ -727,13 +727,19 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return NULL;
+ 		return;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	return elevator_find_get("adios");
-+#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+
- 	if (q->nr_hw_queues != 1 &&
- 	    !blk_mq_is_shared_tags(q->tag_set->flags))
- 		return NULL;
- 
- 	return elevator_find_get("mq-deadline");
++	ctx.name = "adios";
++	goto found;
 +#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
- }
- 
- /*
++
+ 	/*
+ 	 * For single queue devices, default to using mq-deadline. If we
+ 	 * have multiple queues or mq-deadline is not available, default
+ 	 * to "none".
+ 	 */
+-	if (elevator_find_get(ctx.name) && (q->nr_hw_queues == 1 ||
+-			 blk_mq_is_shared_tags(q->tag_set->flags)))
++	if (q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags))
++found:
++	if (elevator_find_get(ctx.name))
+ 		err = elevator_change(q, &ctx);
+ 	if (err < 0)
+ 		pr_warn("\"%s\" elevator initialization, failed %d, "
 -- 
 2.34.1
 
