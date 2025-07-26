@@ -1,14 +1,14 @@
-From 1e32dedd08e3c8f09610a2e0ebb28911df5785d8 Mon Sep 17 00:00:00 2001
+From ceadccd19d8d32bd3cd6c13f5c491f2b6b2c1ce4 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 16 Jul 2025 03:12:53 +0900
-Subject: [PATCH] linux6.16-rc1-ADIOS-2.3.0
+Date: Sun, 27 Jul 2025 03:41:15 +0900
+Subject: [PATCH] linux6.16-rc1-ADIOS-2.3.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1450 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1451 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   10 +-
- 4 files changed, 1480 insertions(+), 2 deletions(-)
+ 4 files changed, 1481 insertions(+), 2 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..a6cf99b0a3
+index 0000000000..4d090bab5e
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1450 @@
+@@ -0,0 +1,1451 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..a6cf99b0a3
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.3.0"
++#define ADIOS_VERSION "2.3.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -488,11 +488,12 @@ index 0000000000..a6cf99b0a3
 +// Input latency data into the latency model
 +static void latency_model_input(struct adios_data *ad,
 +		struct latency_model *model, u32 block_size, u64 latency, u64 pred_lat) {
++	unsigned long flags;
 +	u8 bucket_index;
 +	struct lm_buckets *buckets;
-+	int cpu = get_cpu();
 +
-+	buckets = per_cpu_ptr(model->pcpu_buckets, cpu);
++	local_irq_save(flags);
++	buckets = per_cpu_ptr(model->pcpu_buckets, __smp_processor_id());
 +
 +	if (block_size <= LM_BLOCK_SIZE_THRESHOLD) {
 +		// Handle small requests
@@ -504,7 +505,7 @@ index 0000000000..a6cf99b0a3
 +		buckets->small_bucket[bucket_index].count++;
 +		buckets->small_bucket[bucket_index].sum_latency += latency;
 +
-+		put_cpu();
++		local_irq_restore(flags);
 +
 +		if (unlikely(!model->base)) {
 +			latency_model_update(ad, model);
@@ -513,7 +514,7 @@ index 0000000000..a6cf99b0a3
 +	} else {
 +		// Handle large requests
 +		if (!model->base || !pred_lat) {
-+			put_cpu();
++			local_irq_restore(flags);
 +			return;
 +		}
 +
@@ -526,7 +527,7 @@ index 0000000000..a6cf99b0a3
 +		buckets->large_bucket[bucket_index].sum_latency += latency;
 +		buckets->large_bucket[bucket_index].sum_block_size += block_size;
 +
-+		put_cpu();
++		local_irq_restore(flags);
 +	}
 +}
 +
