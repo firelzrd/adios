@@ -1,14 +1,14 @@
-From ceadccd19d8d32bd3cd6c13f5c491f2b6b2c1ce4 Mon Sep 17 00:00:00 2001
+From 415cebaa7d9616b3f329aeb789f79c1ae2988e0e Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 27 Jul 2025 03:41:15 +0900
-Subject: [PATCH] linux6.16-rc1-ADIOS-2.3.1
+Date: Tue, 29 Jul 2025 02:06:56 +0900
+Subject: [PATCH] linux6.16-ADIOS-2.3.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
  block/adios.c         | 1451 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |   10 +-
- 4 files changed, 1481 insertions(+), 2 deletions(-)
+ block/elevator.c      |   22 +-
+ 4 files changed, 1488 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -1518,31 +1518,45 @@ index 0000000000..4d090bab5e
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index ab22542e6c..62a4ec42ab 100644
+index a960bdc869..bd85694ec8 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -727,13 +727,19 @@ void elevator_set_default(struct request_queue *q)
+@@ -728,6 +728,17 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++	/* efficient ? adios : adios */
 +	ctx.name = "adios";
-+	goto found;
++#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++	bool iosched_should_be_efficient =
++		q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
++	/* efficient ? mq-deadline : none */
++	if (!iosched_should_be_efficient)
++		return;
 +#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
- 	 * to "none".
- 	 */
--	if (elevator_find_get(ctx.name) && (q->nr_hw_queues == 1 ||
--			 blk_mq_is_shared_tags(q->tag_set->flags)))
-+	if (q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags))
-+found:
-+	if (elevator_find_get(ctx.name))
- 		err = elevator_change(q, &ctx);
- 	if (err < 0)
- 		pr_warn("\"%s\" elevator initialization, failed %d, "
+@@ -737,13 +748,10 @@ void elevator_set_default(struct request_queue *q)
+ 	if (!e)
+ 		return;
+ 
+-	if ((q->nr_hw_queues == 1 ||
+-			blk_mq_is_shared_tags(q->tag_set->flags))) {
+-		err = elevator_change(q, &ctx);
+-		if (err < 0)
+-			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
+-					ctx.name, err);
+-	}
++	err = elevator_change(q, &ctx);
++	if (err < 0)
++		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
++				ctx.name, err);
+ 	elevator_put(e);
+ }
+ 
 -- 
 2.34.1
 
