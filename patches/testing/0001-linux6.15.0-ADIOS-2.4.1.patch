@@ -1,14 +1,14 @@
-From b94aeb5bf9460b6f86c52d24a785b10a0af4ffe6 Mon Sep 17 00:00:00 2001
+From efcd6b082177b0a5c9a6cf4e792e3cad115588bb Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 5 Aug 2025 21:59:08 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-2.4.0
+Date: Wed, 6 Aug 2025 03:45:04 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.4.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1463 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1459 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |    5 +
- 4 files changed, 1490 insertions(+)
+ 4 files changed, 1486 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..15d84b58c0
+index 0000000000..7e9ae71246
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1463 @@
+@@ -0,0 +1,1459 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..15d84b58c0
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.4.0"
++#define ADIOS_VERSION "2.4.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -958,17 +958,13 @@ index 0000000000..15d84b58c0
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +
 +	u64 tpl_after = atomic64_sub_return(rd->pred_lat, &ad->total_pred_lat);
-+
-+	if (!rq->io_start_time_ns || !rd->block_size)
-+		return;
-+
 +	u64 lct = ad->last_completed_time ?: rq->io_start_time_ns;
-+	if (unlikely(now < lct))
++	ad->last_completed_time = (tpl_after) ? now : 0;
++
++	if (!rq->io_start_time_ns || !rd->block_size || unlikely(now < lct))
 +		return;
 +
 +	u64 latency = now - lct;
-+	ad->last_completed_time = (tpl_after) ? now : 0;
-+
 +	u8 optype = adios_optype(rq);
 +	latency_model_input(ad, &ad->latency_model[optype],
 +		rd->block_size, latency, rd->pred_lat);

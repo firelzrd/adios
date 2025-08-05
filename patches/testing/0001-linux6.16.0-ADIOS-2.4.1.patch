@@ -1,14 +1,14 @@
-From 9fcbd7f3187f09889a7cac6e5e5b97fcca16faa2 Mon Sep 17 00:00:00 2001
+From 2bdabd8ee6c2f39262f528f9ba756d2ab982fc01 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 5 Aug 2025 21:59:08 +0900
-Subject: [PATCH] linux6.16.0-ADIOS-2.4.0
+Date: Wed, 6 Aug 2025 03:45:04 +0900
+Subject: [PATCH] linux6.16.0-ADIOS-2.4.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1463 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1459 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 1497 insertions(+), 7 deletions(-)
+ 4 files changed, 1493 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..d5275bcd0d
+index 0000000000..61cf2573fd
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1463 @@
+@@ -0,0 +1,1459 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..d5275bcd0d
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.4.0"
++#define ADIOS_VERSION "2.4.1"
 +
 +// Define operation types supported by ADIOS
 +enum adios_op_type {
@@ -958,17 +958,13 @@ index 0000000000..d5275bcd0d
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +
 +	u64 tpl_after = atomic64_sub_return(rd->pred_lat, &ad->total_pred_lat);
-+
-+	if (!rq->io_start_time_ns || !rd->block_size)
-+		return;
-+
 +	u64 lct = ad->last_completed_time ?: rq->io_start_time_ns;
-+	if (unlikely(now < lct))
++	ad->last_completed_time = (tpl_after) ? now : 0;
++
++	if (!rq->io_start_time_ns || !rd->block_size || unlikely(now < lct))
 +		return;
 +
 +	u64 latency = now - lct;
-+	ad->last_completed_time = (tpl_after) ? now : 0;
-+
 +	u8 optype = adios_optype(rq);
 +	latency_model_input(ad, &ad->latency_model[optype],
 +		rd->block_size, latency, rd->pred_lat);
