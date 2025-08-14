@@ -1,14 +1,14 @@
-From 77768b34aaae4fbd04038ff12aefaa15ff967427 Mon Sep 17 00:00:00 2001
+From 5694aedd9fedbbc1e18ab5616a8af3c945eacc22 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 14 Aug 2025 18:22:47 +0900
-Subject: [PATCH] linux6.16.0-ADIOS-2.5.0-rc1
+Date: Thu, 14 Aug 2025 19:26:04 +0900
+Subject: [PATCH] linux6.16.0-ADIOS-2.5.0-rc2
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1531 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1535 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 1565 insertions(+), 7 deletions(-)
+ 4 files changed, 1569 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..b33d6797c2
+index 0000000000..37f43544f6
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1531 @@
+@@ -0,0 +1,1535 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..b33d6797c2
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.5.0-rc1"
++#define ADIOS_VERSION "2.5.0-rc2"
 +
 +/* Request Types:
 + *
@@ -762,12 +762,16 @@ index 0000000000..b33d6797c2
 +// Try to merge a bio into an existing rq before associating it with an rq
 +static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 +		unsigned int nr_segs) {
++	unsigned long flags;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
 +	bool ret;
 +
-+	scoped_guard(spinlock_irqsave, &ad->lock)
-+		ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
++	if (!spin_trylock_irqsave(&ad->lock, flags))
++		return false;
++
++	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
++	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	if (free)
 +		blk_mq_free_request(free);
