@@ -1,14 +1,14 @@
-From 1ab4bcb78486358d9d9eb71411ae18086e42a0d5 Mon Sep 17 00:00:00 2001
+From 2634c08423c5dc27a987c23619ef4a969dad1b65 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 14 Aug 2025 19:26:04 +0900
-Subject: [PATCH] linux6.17-rc1-ADIOS-2.5.0-rc2
+Date: Sat, 16 Aug 2025 05:47:58 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.5.0
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1532 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |   19 +-
- 4 files changed, 1566 insertions(+), 7 deletions(-)
+ block/adios.c         | 1579 +++++++++++++++++++++++++++++++++++++++++
+ block/elevator.c      |    5 +
+ 4 files changed, 1606 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,10 +37,10 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index c65f4da937..105b12fd86 100644
+index 3a941dc0d2..94e3bf608b 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -22,6 +22,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
@@ -48,7 +48,7 @@ index c65f4da937..105b12fd86 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..57a1c24807
+index 0000000000..663f0e1e39
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1532 @@
+@@ -0,0 +1,1579 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..57a1c24807
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.5.0-rc2"
++#define ADIOS_VERSION "2.5.0"
 +
 +/* Request Types:
 + *
@@ -152,6 +152,8 @@ index 0000000000..57a1c24807
 +static u64 default_global_latency_window = 32000000ULL;
 +// Ratio below which batch queues should be refilled
 +static u8  default_bq_refill_below_ratio = 25;
++// FAT compatibility workaround
++static u8  default_place_deadline_pred_lat = 0;
 +
 +// Dynamic thresholds for shrinkage
 +static u32 default_lm_shrink_at_kreqs  =  5000;
@@ -242,6 +244,7 @@ index 0000000000..57a1c24807
 +	u32 batch_actual_max_total;
 +	u32 async_depth;
 +	u8  bq_refill_below_ratio;
++	u8  place_deadline_pred_lat;
 +
 +	bool bq_page;
 +	bool more_bq_ready;
@@ -638,8 +641,11 @@ index 0000000000..57a1c24807
 +
 +	/* Tier-3: Aynchronous Requests
 +	 * - Can be reordered and delayed freely */
-+	if (!(rq->cmd_flags & REQ_SYNC))
-+		rd->deadline += ad->latency_target[adios_optype(rq)] + rd->pred_lat;
++	if (!(rq->cmd_flags & REQ_SYNC)) {
++		rd->deadline += ad->latency_target[adios_optype(rq)];
++		if (ad->place_deadline_pred_lat)
++			rd->deadline += rd->pred_lat;
++	}
 +
 +	while (*link) {
 +		dlg = rb_entry(*link, struct dl_group, node);
@@ -1018,7 +1024,7 @@ index 0000000000..57a1c24807
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = timer_container_of(ad, t, update_timer);
++	struct adios_data *ad = from_timer(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(ad, &ad->latency_model[optype]);
@@ -1090,16 +1096,19 @@ index 0000000000..57a1c24807
 +}
 +
 +// Initialize the scheduler-specific data when initializing the request queue
-+static int adios_init_sched(struct request_queue *q, struct elevator_queue *eq) {
++static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 +	struct adios_data *ad;
++	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
 +	u8 optype = 0;
++
++	eq = elevator_alloc(q, e);
++	if (!eq)
++		return ret;
 +
 +	ad = kzalloc_node(sizeof(*ad), GFP_KERNEL, q->node);
 +	if (!ad)
 +		goto put_eq;
-+
-+	eq->elevator_data = ad;
 +
 +	// Create a memory pool for adios_rq_data
 +	ad->rq_data_pool = kmem_cache_create("rq_data_pool",
@@ -1123,6 +1132,7 @@ index 0000000000..57a1c24807
 +
 +	ad->global_latency_window = default_global_latency_window;
 +	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
++	ad->place_deadline_pred_lat = default_place_deadline_pred_lat;
 +
 +	for (int i = 0; i < 2; i++)
 +		INIT_LIST_HEAD(&ad->prio_queue[i]);
@@ -1269,6 +1279,11 @@ index 0000000000..57a1c24807
 +	reset_buckets(ad->aggr_buckets); \
 +	return count; \
 +} \
++static ssize_t adios_lat_target_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	return sprintf(page, "%llu\n", ad->latency_target[optype]); \
++} \
 +static ssize_t adios_lat_target_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
 +	struct adios_data *ad = e->elevator_data; \
@@ -1281,10 +1296,10 @@ index 0000000000..57a1c24807
 +	ad->latency_target[optype] = nsec; \
 +	return count; \
 +} \
-+static ssize_t adios_lat_target_##name##_show( \
++static ssize_t adios_batch_limit_##name##_show( \
 +		struct elevator_queue *e, char *page) { \
 +	struct adios_data *ad = e->elevator_data; \
-+	return sprintf(page, "%llu\n", ad->latency_target[optype]); \
++	return sprintf(page, "%u\n", ad->batch_limit[optype]); \
 +} \
 +static ssize_t adios_batch_limit_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
@@ -1296,11 +1311,6 @@ index 0000000000..57a1c24807
 +	struct adios_data *ad = e->elevator_data; \
 +	ad->batch_limit[optype] = max_batch; \
 +	return count; \
-+} \
-+static ssize_t adios_batch_limit_##name##_show( \
-+		struct elevator_queue *e, char *page) { \
-+	struct adios_data *ad = e->elevator_data; \
-+	return sprintf(page, "%u\n", ad->batch_limit[optype]); \
 +}
 +
 +SYSFS_OPTYPE_DECL(read, ADIOS_READ);
@@ -1323,6 +1333,13 @@ index 0000000000..57a1c24807
 +		total_count, discard_count, read_count, write_count);
 +}
 +
++// Show the global latency window
++static ssize_t adios_global_latency_window_show(
++		struct elevator_queue *e, char *page) {
++	struct adios_data *ad = e->elevator_data;
++	return sprintf(page, "%llu\n", ad->global_latency_window);
++}
++
 +// Set the global latency window
 +static ssize_t adios_global_latency_window_store(
 +		struct elevator_queue *e, const char *page, size_t count) {
@@ -1337,13 +1354,6 @@ index 0000000000..57a1c24807
 +	ad->global_latency_window = nsec;
 +
 +	return count;
-+}
-+
-+// Show the global latency window
-+static ssize_t adios_global_latency_window_show(
-+		struct elevator_queue *e, char *page) {
-+	struct adios_data *ad = e->elevator_data;
-+	return sprintf(page, "%llu\n", ad->global_latency_window);
 +}
 +
 +// Show the bq_refill_below_ratio
@@ -1390,6 +1400,42 @@ index 0000000000..57a1c24807
 +	guard(spinlock_irqsave)(&ad->lock);
 +	ad->dl_prio[0] = prio;
 +	ad->dl_bias = 0;
++
++	return count;
++}
++
++/* place_deadline_pred_lat: A sysfs-tunable switch for latency optimization
++ *
++ * This flag controls whether predicted latency (`pred_lat`) is used to
++ * calculate deadlines for asynchronous (Tier 3) requests.
++ *
++ * When enabled (1), this allows small, latency-sensitive I/Os (e.g., from
++ * interactive tasks) to be prioritized over large background transfers.
++ * This aggressive reordering may improve perceived system responsiveness.
++ *
++ * However, this can expose ordering issues in older filesystems like
++ * FAT which may implicitly assume more strict async I/O order dependencies.
++ *
++ * For maximum compatibility, this is disabled by default (0).
++ */
++static ssize_t adios_place_deadline_pred_lat_show(
++		struct elevator_queue *e, char *page) {
++	struct adios_data *ad = e->elevator_data;
++	return sprintf(page, "%d\n", ad->place_deadline_pred_lat);
++}
++
++static ssize_t adios_place_deadline_pred_lat_store(
++		struct elevator_queue *e, const char *page, size_t count) {
++	struct adios_data *ad = e->elevator_data;
++	int val;
++	int ret;
++
++	ret = kstrtoint(page, 10, &val);
++	if (ret || val < 0 || val > 1)
++		return -EINVAL;
++
++	guard(spinlock_irqsave)(&ad->lock);
++	ad->place_deadline_pred_lat = val;
 +
 +	return count;
 +}
@@ -1524,6 +1570,7 @@ index 0000000000..57a1c24807
 +	AD_ATTR_RO(batch_actual_max),
 +	AD_ATTR_RW(bq_refill_below_ratio),
 +	AD_ATTR_RW(global_latency_window),
++	AD_ATTR_RW(place_deadline_pred_lat),
 +
 +	AD_ATTR_RW(batch_limit_read),
 +	AD_ATTR_RW(batch_limit_write),
@@ -1599,42 +1646,26 @@ index 0000000000..57a1c24807
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index fe96c6f475..ef7339fb40 100644
+index b4d08026b0..2613213992 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return;
+ 		return NULL;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	ctx.name = "adios";
++	return elevator_find_get("adios");
 +#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
-+	if (!is_sq)
-+		return;
-+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +
- 	/*
- 	 * For single queue devices, default to using mq-deadline. If we
- 	 * have multiple queues or mq-deadline is not available, default
-@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
- 	if (!e)
- 		return;
+ 	if (q->nr_hw_queues != 1 &&
+ 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+ 		return NULL;
  
--	if ((q->nr_hw_queues == 1 ||
--			blk_mq_is_shared_tags(q->tag_set->flags))) {
--		err = elevator_change(q, &ctx);
--		if (err < 0)
--			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
--					ctx.name, err);
--	}
-+	err = elevator_change(q, &ctx);
-+	if (err < 0)
-+		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
-+				ctx.name, err);
- 	elevator_put(e);
+ 	return elevator_find_get("mq-deadline");
++#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
  }
  
+ /*
 -- 
 2.34.1
 

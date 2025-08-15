@@ -1,14 +1,14 @@
-From efcd6b082177b0a5c9a6cf4e792e3cad115588bb Mon Sep 17 00:00:00 2001
+From 032ce7e28bb762abc3d2963ba0b822690aacfc5a Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 6 Aug 2025 03:45:04 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-2.4.1
+Date: Sat, 16 Aug 2025 05:47:58 +0900
+Subject: [PATCH] linux6.16.0-ADIOS-2.5.0
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1459 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |    5 +
- 4 files changed, 1486 insertions(+)
+ block/adios.c         | 1579 +++++++++++++++++++++++++++++++++++++++++
+ block/elevator.c      |   19 +-
+ 4 files changed, 1613 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,10 +37,10 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index 3a941dc0d2..94e3bf608b 100644
+index c65f4da937..105b12fd86 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -22,6 +22,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
@@ -48,7 +48,7 @@ index 3a941dc0d2..94e3bf608b 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,10 +61,10 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..7e9ae71246
+index 0000000000..fe987ef165
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1459 @@
+@@ -0,0 +1,1579 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,9 +90,56 @@ index 0000000000..7e9ae71246
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.4.1"
++#define ADIOS_VERSION "2.5.0"
 +
-+// Define operation types supported by ADIOS
++/* Request Types:
++ *
++ * Tier 0 (Highest Priority): Emergency & System Integrity Requests
++ * -----------------------------------------------------------------
++ * - Target: Requests with the BLK_MQ_INSERT_AT_HEAD flag.
++ * - Purpose: For critical, non-negotiable operations such as device error
++ *   recovery or flush sequences that must bypass all other scheduling logic.
++ * - Implementation: Placed in a dedicated, high-priority FIFO queue
++ *   (`prio_queue[0]`) for immediate dispatch.
++ *
++ * Tier 1 (High Priority): Data Persistence & Ordering Guarantees
++ * ---------------------------------------------------------------
++ * - Target: Requests with integrity-sensitive flags like REQ_FUA or
++ *   REQ_PREFLUSH, typically originating from O_DIRECT I/O.
++ * - Purpose: To ensure strict ordering and data persistence guarantees,
++ *   preventing data corruption in applications like databases.
++ * - Implementation: Handled in a separate, secondary FIFO queue
++ *   (`prio_queue[1]`) to ensure they are processed in submission order and
++ *   before any lower-priority requests.
++ *
++ * Tier 2 (Medium Priority): Application Responsiveness
++ * ----------------------------------------------------
++ * - Target: Normal synchronous requests (e.g., from standard file reads).
++ * - Purpose: To ensure correct application behavior for operations that
++ *   depend on sequential I/O completion (e.g., file system mounts) and to
++ *   provide low latency for interactive applications.
++ * - Implementation: The deadline for these requests is set to their start
++ *   time (`rq->start_time_ns`). This effectively enforces FIFO-like behavior
++ *   within the deadline-sorted red-black tree, preventing out-of-order
++ *   execution of dependent synchronous operations.
++ *
++ * Tier 3 (Normal Priority): Background Throughput
++ * -----------------------------------------------
++ * - Target: Asynchronous requests.
++ * - Purpose: To maximize disk throughput for background tasks where latency
++ *   is not critical.
++ * - Implementation: These are the only requests where ADIOS's adaptive
++ *   latency prediction model is used. A dynamic deadline is calculated based
++ *   on the predicted I/O latency, allowing for aggressive reordering to
++ *   optimize I/O efficiency.
++ *
++ * Dispatch Logic:
++ * The scheduler always dispatches requests in strict priority order:
++ * 1. prio_queue[0] (Tier 0)
++ * 2. prio_queue[1] (Tier 1)
++ * 3. The deadline-sorted batch queue (which naturally prioritizes Tier 2
++ *    over Tier 3 due to their calculated deadlines).
++ */
 +enum adios_op_type {
 +	ADIOS_READ    = 0,
 +	ADIOS_WRITE   = 1,
@@ -105,6 +152,8 @@ index 0000000000..7e9ae71246
 +static u64 default_global_latency_window = 32000000ULL;
 +// Ratio below which batch queues should be refilled
 +static u8  default_bq_refill_below_ratio = 25;
++// FAT compatibility workaround
++static u8  default_place_deadline_pred_lat = 0;
 +
 +// Dynamic thresholds for shrinkage
 +static u32 default_lm_shrink_at_kreqs  =  5000;
@@ -149,7 +198,7 @@ index 0000000000..7e9ae71246
 +	u32 count;
 +};
 +
-+// New structure to hold per-cpu buckets, improving data locality and code clarity.
++// Structure to hold per-cpu buckets, improving data locality and code clarity.
 +struct lm_buckets {
 +	struct latency_bucket_small small_bucket[LM_LAT_BUCKET_COUNT];
 +	struct latency_bucket_large large_bucket[LM_LAT_BUCKET_COUNT];
@@ -180,7 +229,7 @@ index 0000000000..7e9ae71246
 +// Adios scheduler data
 +struct adios_data {
 +	spinlock_t pq_lock;
-+	struct list_head prio_queue;
++	struct list_head prio_queue[2];
 +
 +	struct rb_root_cached dl_tree[2];
 +	spinlock_t lock;
@@ -195,6 +244,7 @@ index 0000000000..7e9ae71246
 +	u32 batch_actual_max_total;
 +	u32 async_depth;
 +	u8  bq_refill_below_ratio;
++	u8  place_deadline_pred_lat;
 +
 +	bool bq_page;
 +	bool more_bq_ready;
@@ -583,9 +633,19 @@ index 0000000000..7e9ae71246
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	struct dl_group *dlg;
 +
-+	u8 optype = adios_optype(rq);
-+	rd->deadline =
-+		rq->start_time_ns + ad->latency_target[optype] + rd->pred_lat;
++	/* Tier-2: Synchronous Requests
++	 * - Needs to be FIFO within a same optype
++	 * - Relaxed order between different optypes
++	 * - basically needs to be processed in early time */
++	rd->deadline = rq->start_time_ns;
++
++	/* Tier-3: Aynchronous Requests
++	 * - Can be reordered and delayed freely */
++	if (!(rq->cmd_flags & REQ_SYNC)) {
++		rd->deadline += ad->latency_target[adios_optype(rq)];
++		if (ad->place_deadline_pred_lat)
++			rd->deadline += rd->pred_lat;
++	}
 +
 +	while (*link) {
 +		dlg = rb_entry(*link, struct dl_group, node);
@@ -708,12 +768,16 @@ index 0000000000..7e9ae71246
 +// Try to merge a bio into an existing rq before associating it with an rq
 +static bool adios_bio_merge(struct request_queue *q, struct bio *bio,
 +		unsigned int nr_segs) {
++	unsigned long flags;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct request *free = NULL;
 +	bool ret;
 +
-+	scoped_guard(spinlock_irqsave, &ad->lock)
-+		ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
++	if (!spin_trylock_irqsave(&ad->lock, flags))
++		return false;
++
++	ret = blk_mq_sched_try_merge(q, bio, nr_segs, &free);
++	spin_unlock_irqrestore(&ad->lock, flags);
 +
 +	if (free)
 +		blk_mq_free_request(free);
@@ -734,10 +798,20 @@ index 0000000000..7e9ae71246
 +	rd->pred_lat =
 +		latency_model_predict(&ad->latency_model[optype], rd->block_size);
 +
++	/* Tier-0: BLK_MQ_INSERT_AT_HEAD Requests
++	 * - Needs to be processed ASAP at all costs in any case */
 +	if (insert_flags & BLK_MQ_INSERT_AT_HEAD) {
 +		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 +		scoped_guard(spinlock_irqsave, &ad->pq_lock)
-+			list_add_tail(&rq->queuelist, &ad->prio_queue);
++			list_add_tail(&rq->queuelist, &ad->prio_queue[0]);
++		return;
++	}
++	/* Tier-1: Integrity-sensitive Requests
++	 * - Needs to be FIFO across all optypes */
++	if (rq->cmd_flags & (REQ_FUA | REQ_PREFLUSH)) {
++		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
++		scoped_guard(spinlock_irqsave, &ad->pq_lock)
++			list_add_tail(&rq->queuelist, &ad->prio_queue[1]);
 +		return;
 +	}
 +
@@ -923,9 +997,13 @@ index 0000000000..7e9ae71246
 +
 +	guard(spinlock_irqsave)(&ad->pq_lock);
 +
-+	if (!list_empty(&ad->prio_queue)) {
-+		rq = list_first_entry(&ad->prio_queue, struct request, queuelist);
-+		list_del_init(&rq->queuelist);
++	for (int i = 0; i < 2; i++) {
++		struct list_head *q = &ad->prio_queue[i];
++		if (!list_empty(q)) {
++			rq = list_first_entry(q, struct request, queuelist);
++			list_del_init(&rq->queuelist);
++			break;
++		}
 +	}
 +	return rq;
 +}
@@ -946,7 +1024,7 @@ index 0000000000..7e9ae71246
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = from_timer(ad, t, update_timer);
++	struct adios_data *ad = timer_container_of(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(ad, &ad->latency_model[optype]);
@@ -984,7 +1062,9 @@ index 0000000000..7e9ae71246
 +
 +static inline bool pq_has_work(struct adios_data *ad) {
 +	guard(spinlock_irqsave)(&ad->pq_lock);
-+	return !list_empty(&ad->prio_queue);
++	for (int i = 0; i < 2; i++)
++		if (!list_empty(&ad->prio_queue[i])) return true;
++	return false;
 +}
 +
 +static inline bool bq_has_work(struct adios_data *ad) {
@@ -1052,8 +1132,10 @@ index 0000000000..7e9ae71246
 +
 +	ad->global_latency_window = default_global_latency_window;
 +	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
++	ad->place_deadline_pred_lat = default_place_deadline_pred_lat;
 +
-+	INIT_LIST_HEAD(&ad->prio_queue);
++	for (int i = 0; i < 2; i++)
++		INIT_LIST_HEAD(&ad->prio_queue[i]);
 +	for (u8 i = 0; i < 2; i++)
 +		ad->dl_tree[i] = RB_ROOT_CACHED;
 +	ad->dl_bias = 0;
@@ -1126,7 +1208,8 @@ index 0000000000..7e9ae71246
 +
 +	timer_shutdown_sync(&ad->update_timer);
 +
-+	WARN_ON_ONCE(!list_empty(&ad->prio_queue));
++	for (int i = 0; i < 2; i++)
++		WARN_ON_ONCE(!list_empty(&ad->prio_queue[i]));
 +
 +	for (u8 i = 0; i < ADIOS_OPTYPES; i++) {
 +		struct latency_model *model = &ad->latency_model[i];
@@ -1196,6 +1279,11 @@ index 0000000000..7e9ae71246
 +	reset_buckets(ad->aggr_buckets); \
 +	return count; \
 +} \
++static ssize_t adios_lat_target_##name##_show( \
++		struct elevator_queue *e, char *page) { \
++	struct adios_data *ad = e->elevator_data; \
++	return sprintf(page, "%llu\n", ad->latency_target[optype]); \
++} \
 +static ssize_t adios_lat_target_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
 +	struct adios_data *ad = e->elevator_data; \
@@ -1208,10 +1296,10 @@ index 0000000000..7e9ae71246
 +	ad->latency_target[optype] = nsec; \
 +	return count; \
 +} \
-+static ssize_t adios_lat_target_##name##_show( \
++static ssize_t adios_batch_limit_##name##_show( \
 +		struct elevator_queue *e, char *page) { \
 +	struct adios_data *ad = e->elevator_data; \
-+	return sprintf(page, "%llu\n", ad->latency_target[optype]); \
++	return sprintf(page, "%u\n", ad->batch_limit[optype]); \
 +} \
 +static ssize_t adios_batch_limit_##name##_store( \
 +		struct elevator_queue *e, const char *page, size_t count) { \
@@ -1223,11 +1311,6 @@ index 0000000000..7e9ae71246
 +	struct adios_data *ad = e->elevator_data; \
 +	ad->batch_limit[optype] = max_batch; \
 +	return count; \
-+} \
-+static ssize_t adios_batch_limit_##name##_show( \
-+		struct elevator_queue *e, char *page) { \
-+	struct adios_data *ad = e->elevator_data; \
-+	return sprintf(page, "%u\n", ad->batch_limit[optype]); \
 +}
 +
 +SYSFS_OPTYPE_DECL(read, ADIOS_READ);
@@ -1250,6 +1333,13 @@ index 0000000000..7e9ae71246
 +		total_count, discard_count, read_count, write_count);
 +}
 +
++// Show the global latency window
++static ssize_t adios_global_latency_window_show(
++		struct elevator_queue *e, char *page) {
++	struct adios_data *ad = e->elevator_data;
++	return sprintf(page, "%llu\n", ad->global_latency_window);
++}
++
 +// Set the global latency window
 +static ssize_t adios_global_latency_window_store(
 +		struct elevator_queue *e, const char *page, size_t count) {
@@ -1264,13 +1354,6 @@ index 0000000000..7e9ae71246
 +	ad->global_latency_window = nsec;
 +
 +	return count;
-+}
-+
-+// Show the global latency window
-+static ssize_t adios_global_latency_window_show(
-+		struct elevator_queue *e, char *page) {
-+	struct adios_data *ad = e->elevator_data;
-+	return sprintf(page, "%llu\n", ad->global_latency_window);
 +}
 +
 +// Show the bq_refill_below_ratio
@@ -1317,6 +1400,42 @@ index 0000000000..7e9ae71246
 +	guard(spinlock_irqsave)(&ad->lock);
 +	ad->dl_prio[0] = prio;
 +	ad->dl_bias = 0;
++
++	return count;
++}
++
++/* place_deadline_pred_lat: A sysfs-tunable switch for latency optimization
++ *
++ * This flag controls whether predicted latency (`pred_lat`) is used to
++ * calculate deadlines for asynchronous (Tier 3) requests.
++ *
++ * When enabled (1), this allows small, latency-sensitive I/Os (e.g., from
++ * interactive tasks) to be prioritized over large background transfers.
++ * This aggressive reordering may improve perceived system responsiveness.
++ *
++ * However, this can expose ordering issues in older filesystems like
++ * FAT which may implicitly assume more strict async I/O order dependencies.
++ *
++ * For maximum compatibility, this is disabled by default (0).
++ */
++static ssize_t adios_place_deadline_pred_lat_show(
++		struct elevator_queue *e, char *page) {
++	struct adios_data *ad = e->elevator_data;
++	return sprintf(page, "%d\n", ad->place_deadline_pred_lat);
++}
++
++static ssize_t adios_place_deadline_pred_lat_store(
++		struct elevator_queue *e, const char *page, size_t count) {
++	struct adios_data *ad = e->elevator_data;
++	int val;
++	int ret;
++
++	ret = kstrtoint(page, 10, &val);
++	if (ret || val < 0 || val > 1)
++		return -EINVAL;
++
++	guard(spinlock_irqsave)(&ad->lock);
++	ad->place_deadline_pred_lat = val;
 +
 +	return count;
 +}
@@ -1451,6 +1570,7 @@ index 0000000000..7e9ae71246
 +	AD_ATTR_RO(batch_actual_max),
 +	AD_ATTR_RW(bq_refill_below_ratio),
 +	AD_ATTR_RW(global_latency_window),
++	AD_ATTR_RW(place_deadline_pred_lat),
 +
 +	AD_ATTR_RW(batch_limit_read),
 +	AD_ATTR_RW(batch_limit_write),
@@ -1526,26 +1646,42 @@ index 0000000000..7e9ae71246
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index b4d08026b0..2613213992 100644
+index a960bdc869..96fd08a009 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
+@@ -728,6 +728,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return NULL;
+ 		return;
  
 +#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	return elevator_find_get("adios");
++	ctx.name = "adios";
 +#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+
- 	if (q->nr_hw_queues != 1 &&
- 	    !blk_mq_is_shared_tags(q->tag_set->flags))
- 		return NULL;
- 
- 	return elevator_find_get("mq-deadline");
++	bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
++	if (!is_sq)
++		return;
 +#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++
+ 	/*
+ 	 * For single queue devices, default to using mq-deadline. If we
+ 	 * have multiple queues or mq-deadline is not available, default
+@@ -737,13 +745,10 @@ void elevator_set_default(struct request_queue *q)
+ 	if (!e)
+ 		return;
+ 
+-	if ((q->nr_hw_queues == 1 ||
+-			blk_mq_is_shared_tags(q->tag_set->flags))) {
+-		err = elevator_change(q, &ctx);
+-		if (err < 0)
+-			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
+-					ctx.name, err);
+-	}
++	err = elevator_change(q, &ctx);
++	if (err < 0)
++		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
++				ctx.name, err);
+ 	elevator_put(e);
  }
  
- /*
 -- 
 2.34.1
 
