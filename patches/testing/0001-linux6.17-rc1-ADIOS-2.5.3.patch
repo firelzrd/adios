@@ -1,14 +1,14 @@
-From a0662719e9d2169b8d57174aa0ff711d22b3404b Mon Sep 17 00:00:00 2001
+From 56f3167f5d2f60726748a74ec9b875c117467c8e Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 17 Aug 2025 22:55:33 +0900
-Subject: [PATCH] linux6.17-rc1-ADIOS-2.5.2
+Date: Sun, 17 Aug 2025 23:07:10 +0900
+Subject: [PATCH] linux6.17-rc1-ADIOS-2.5.3
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1583 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1590 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   18 +-
- 4 files changed, 1616 insertions(+), 7 deletions(-)
+ 4 files changed, 1623 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..ab43d084ad
+index 0000000000..a09bcb72b6
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1583 @@
+@@ -0,0 +1,1590 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..ab43d084ad
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.5.2"
++#define ADIOS_VERSION "2.5.3"
 +
 +/* Request Types:
 + *
@@ -154,6 +154,7 @@ index 0000000000..ab43d084ad
 +static u8  default_bq_refill_below_ratio = 25;
 +// Use predicted latency in deadline calculation of async requests
 +static u8  default_place_deadline_pred_lat = 0;
++static u64 default_lat_model_latency_limit = 500000000ULL;
 +
 +// Dynamic thresholds for shrinkage
 +static u32 default_lm_shrink_at_kreqs  =  5000;
@@ -251,6 +252,7 @@ index 0000000000..ab43d084ad
 +	u32 batch_actual_max_size[ADIOS_OPTYPES];
 +	u32 batch_actual_max_total;
 +	u32 async_depth;
++	u32 lat_model_latency_limit;
 +	u8  bq_refill_below_ratio;
 +	u8  place_deadline_pred_lat;
 +
@@ -1072,6 +1074,8 @@ index 0000000000..ab43d084ad
 +		return;
 +
 +	u64 latency = now - lct;
++	if (latency > ad->lat_model_latency_limit)
++		return;
 +	u8 optype = adios_optype(rq);
 +	latency_model_input(ad, &ad->latency_model[optype],
 +		rd->block_size, latency, rd->pred_lat);
@@ -1159,6 +1163,7 @@ index 0000000000..ab43d084ad
 +	ad->global_latency_window = default_global_latency_window;
 +	ad->bq_refill_below_ratio = default_bq_refill_below_ratio;
 +	ad->place_deadline_pred_lat = default_place_deadline_pred_lat;
++	ad->lat_model_latency_limit = default_lat_model_latency_limit;
 +
 +	for (int i = 0; i < 2; i++)
 +		INIT_LIST_HEAD(&ad->prio_queue[i]);
@@ -1418,6 +1423,7 @@ index 0000000000..ab43d084ad
 + * For maximum compatibility, this is disabled by default (0).
 + */
 +SYSFS_INT_DECL(place_deadline_pred_lat, 0, 1)
++SYSFS_INT_DECL(lat_model_latency_limit, 0, 2*NSEC_PER_SEC)
 +
 +// Show the read priority
 +static ssize_t adios_read_priority_show(
@@ -1575,6 +1581,7 @@ index 0000000000..ab43d084ad
 +	AD_ATTR_RW(bq_refill_below_ratio),
 +	AD_ATTR_RW(global_latency_window),
 +	AD_ATTR_RW(place_deadline_pred_lat),
++	AD_ATTR_RW(lat_model_latency_limit),
 +
 +	AD_ATTR_RW(batch_limit_read),
 +	AD_ATTR_RW(batch_limit_write),
