@@ -1,14 +1,14 @@
-From 9917d4cbe7fb53ad8edd3b090aec2985991a0ec3 Mon Sep 17 00:00:00 2001
+From 438f5fd6ee5e533399fba2194eecf8a3971cc6ed Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 17 Aug 2025 06:26:05 +0900
-Subject: [PATCH] linux6.16.0-ADIOS-2.5.1
+Date: Sun, 17 Aug 2025 22:55:33 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-2.5.2
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1555 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |   18 +-
- 4 files changed, 1588 insertions(+), 7 deletions(-)
+ block/adios.c         | 1586 +++++++++++++++++++++++++++++++++++++++++
+ block/elevator.c      |    5 +
+ 4 files changed, 1613 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -37,10 +37,10 @@ index 27f11320b8..e98585dd83 100644
  	tristate "BFQ I/O scheduler"
  	select BLK_ICQ
 diff --git a/block/Makefile b/block/Makefile
-index c65f4da937..105b12fd86 100644
+index 3a941dc0d2..94e3bf608b 100644
 --- a/block/Makefile
 +++ b/block/Makefile
-@@ -22,6 +22,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
+@@ -23,6 +23,7 @@ obj-$(CONFIG_BLK_CGROUP_IOLATENCY)	+= blk-iolatency.o
  obj-$(CONFIG_BLK_CGROUP_IOCOST)	+= blk-iocost.o
  obj-$(CONFIG_MQ_IOSCHED_DEADLINE)	+= mq-deadline.o
  obj-$(CONFIG_MQ_IOSCHED_KYBER)	+= kyber-iosched.o
@@ -48,7 +48,7 @@ index c65f4da937..105b12fd86 100644
  bfq-y				:= bfq-iosched.o bfq-wf2q.o bfq-cgroup.o
  obj-$(CONFIG_IOSCHED_BFQ)	+= bfq.o
  
-@@ -36,3 +37,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
+@@ -37,3 +38,10 @@ obj-$(CONFIG_BLK_INLINE_ENCRYPTION)	+= blk-crypto.o blk-crypto-profile.o \
  					   blk-crypto-sysfs.o
  obj-$(CONFIG_BLK_INLINE_ENCRYPTION_FALLBACK)	+= blk-crypto-fallback.o
  obj-$(CONFIG_BLOCK_HOLDER_DEPRECATED)	+= holder.o
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..82fd86d472
+index 0000000000..aec9a1e9b4
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1555 @@
+@@ -0,0 +1,1586 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -90,7 +90,7 @@ index 0000000000..82fd86d472
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.5.1"
++#define ADIOS_VERSION "2.5.2"
 +
 +/* Request Types:
 + *
@@ -152,7 +152,7 @@ index 0000000000..82fd86d472
 +static u64 default_global_latency_window = 16000000ULL;
 +// Ratio below which batch queues should be refilled
 +static u8  default_bq_refill_below_ratio = 25;
-+// FAT compatibility workaround
++// Use predicted latency in deadline calculation of async requests
 +static u8  default_place_deadline_pred_lat = 0;
 +
 +// Dynamic thresholds for shrinkage
@@ -226,6 +226,11 @@ index 0000000000..82fd86d472
 +#define ADIOS_BQ_PAGES 2
 +#define ADIOS_MAX_INSERTS_PER_LOCK 16
 +
++static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
++	struct request *rq, blk_insert_t insert_flags, struct list_head *free);
++static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
++	struct request *rq, blk_insert_t insert_flags, struct list_head *free);
++
 +// Adios scheduler data
 +struct adios_data {
 +	spinlock_t pq_lock;
@@ -236,6 +241,9 @@ index 0000000000..82fd86d472
 +	u8  dl_queued;
 +	s64 dl_bias;
 +	s32 dl_prio[2];
++
++	void (*insert_request_fn)(struct blk_mq_hw_ctx *, struct request *,
++								blk_insert_t, struct list_head *);
 +
 +	u64 global_latency_window;
 +	u64 latency_target[ADIOS_OPTYPES];
@@ -785,9 +793,30 @@ index 0000000000..82fd86d472
 +	return ret;
 +}
 +
-+// Insert a request into the scheduler
-+static void insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
-+				  blk_insert_t insert_flags, struct list_head *free) {
++// Insert a request into the scheduler (before Read & Write models stabilizes)
++static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
++		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
++	struct adios_data *ad = hctx->queue->elevator->elevator_data;
++	struct adios_rq_data *rd = get_rq_data(rq);
++	u8 optype = adios_optype(rq);
++	u8 idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
++
++	rd->block_size = blk_rq_bytes(rq);
++	rd->pred_lat =
++		latency_model_predict(&ad->latency_model[optype], rd->block_size);
++
++	atomic64_add(rd->pred_lat, &ad->total_pred_lat);
++	scoped_guard(spinlock_irqsave, &ad->pq_lock)
++		list_add_tail(&rq->queuelist, &ad->prio_queue[idx]);
++
++	if (ad->latency_model[ADIOS_READ].base > 0 &&
++		ad->latency_model[ADIOS_WRITE].base > 0)
++			ad->insert_request_fn = insert_request_post_stability;
++}
++
++// Insert a request into the scheduler (after Read & Write models stabilized)
++static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
++		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
 +	struct request_queue *q = hctx->queue;
 +	struct adios_data *ad = q->elevator->elevator_data;
 +	struct adios_rq_data *rd = get_rq_data(rq);
@@ -846,7 +875,7 @@ index 0000000000..82fd86d472
 +			}
 +			rq = list_first_entry(list, struct request, queuelist);
 +			list_del_init(&rq->queuelist);
-+			insert_request(hctx, rq, insert_flags, &free);
++			ad->insert_request_fn(hctx, rq, insert_flags, &free);
 +		}
 +	} while (!stop);
 +
@@ -1024,7 +1053,7 @@ index 0000000000..82fd86d472
 +
 +// Timer callback function to periodically update latency models
 +static void update_timer_callback(struct timer_list *t) {
-+	struct adios_data *ad = timer_container_of(ad, t, update_timer);
++	struct adios_data *ad = from_timer(ad, t, update_timer);
 +
 +	for (u8 optype = 0; optype < ADIOS_OPTYPES; optype++)
 +		latency_model_update(ad, &ad->latency_model[optype]);
@@ -1174,6 +1203,8 @@ index 0000000000..82fd86d472
 +	spin_lock_init(&ad->lock);
 +	spin_lock_init(&ad->pq_lock);
 +	spin_lock_init(&ad->bq_lock);
++
++	ad->insert_request_fn = insert_request_pre_stability;
 +
 +	/* We dispatch from request queue wide instead of hw queue */
 +	blk_queue_flag_set(QUEUE_FLAG_SQ_SCHED, q);
@@ -1622,48 +1653,26 @@ index 0000000000..82fd86d472
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index a960bdc869..b103a1be90 100644
+index b4d08026b0..c2bcc54ebd 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -721,6 +721,9 @@ void elevator_set_default(struct request_queue *q)
- 	};
- 	int err;
- 	struct elevator_type *e;
-+#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	ctx.name = "adios";
-+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
- 
- 	/* now we allow to switch elevator */
- 	blk_queue_flag_clear(QUEUE_FLAG_NO_ELV_SWITCH, q);
-@@ -728,6 +731,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -556,11 +556,16 @@ static struct elevator_type *elevator_get_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
- 		return;
+ 		return NULL;
  
-+	bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
-+	if (!is_sq)
-+		return;
 +
- 	/*
- 	 * For single queue devices, default to using mq-deadline. If we
- 	 * have multiple queues or mq-deadline is not available, default
-@@ -737,13 +744,10 @@ void elevator_set_default(struct request_queue *q)
- 	if (!e)
- 		return;
+ 	if (q->nr_hw_queues != 1 &&
+ 	    !blk_mq_is_shared_tags(q->tag_set->flags))
+ 		return NULL;
  
--	if ((q->nr_hw_queues == 1 ||
--			blk_mq_is_shared_tags(q->tag_set->flags))) {
--		err = elevator_change(q, &ctx);
--		if (err < 0)
--			pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
--					ctx.name, err);
--	}
-+	err = elevator_change(q, &ctx);
-+	if (err < 0)
-+		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
-+				ctx.name, err);
- 	elevator_put(e);
++#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++	return elevator_find_get("adios");
++#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
+ 	return elevator_find_get("mq-deadline");
++#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
  }
  
+ /*
 -- 
 2.34.1
 
