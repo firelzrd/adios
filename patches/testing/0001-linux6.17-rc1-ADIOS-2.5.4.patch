@@ -1,14 +1,14 @@
-From 56f3167f5d2f60726748a74ec9b875c117467c8e Mon Sep 17 00:00:00 2001
+From 4c2d1cdf54cbfe8d7d6d799bf18a1bd9ee699a8e Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 17 Aug 2025 23:07:10 +0900
-Subject: [PATCH] linux6.17-rc1-ADIOS-2.5.3
+Date: Mon, 18 Aug 2025 09:38:21 +0900
+Subject: [PATCH] linux6.17-rc1-ADIOS-2.5.4
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
  block/adios.c         | 1590 +++++++++++++++++++++++++++++++++++++++++
- block/elevator.c      |   18 +-
- 4 files changed, 1623 insertions(+), 7 deletions(-)
+ block/elevator.c      |   19 +-
+ 4 files changed, 1624 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,7 +61,7 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..a09bcb72b6
+index 0000000000..b04a90c255
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1590 @@
@@ -90,7 +90,7 @@ index 0000000000..a09bcb72b6
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "2.5.3"
++#define ADIOS_VERSION "2.5.4"
 +
 +/* Request Types:
 + *
@@ -149,7 +149,7 @@ index 0000000000..a09bcb72b6
 +};
 +
 +// Global variable to control the latency
-+static u64 default_global_latency_window = 16000000ULL;
++static u64 default_global_latency_window = 24000000ULL;
 +// Ratio below which batch queues should be refilled
 +static u8  default_bq_refill_below_ratio = 25;
 +// Use predicted latency in deadline calculation of async requests
@@ -1657,31 +1657,25 @@ index 0000000000..a09bcb72b6
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index fe96c6f475..4eb6f9cb4c 100644
+index fe96c6f475..ef7339fb40 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -745,6 +745,9 @@ void elevator_set_default(struct request_queue *q)
- 	};
- 	int err;
- 	struct elevator_type *e;
-+#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-+	ctx.name = "adios";
-+#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
- 
- 	/* now we allow to switch elevator */
- 	blk_queue_flag_clear(QUEUE_FLAG_NO_ELV_SWITCH, q);
-@@ -752,6 +755,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
++#ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
++	ctx.name = "adios";
++#else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +	bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
 +	if (!is_sq)
 +		return;
++#endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 +
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -761,13 +768,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
  	if (!e)
  		return;
  
