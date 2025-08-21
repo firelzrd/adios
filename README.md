@@ -76,6 +76,10 @@ ADIOS provides several tunables via sysfs, allowing users to fine-tune its behav
 
 *   **`reset_lat_model`**: (Write-only) Writing `1` to this attribute resets the learned latency model to its initial, zero value. Alternatively, you can load initial values for all operation types by writing six space-separated values in the format `"R_base R_slope W_base W_slope D_base D_slope"`.
 
+## FAQ
+
+*   **Q. In benchmarks my HDD with ADIOS shows a lower maximum throughput compared to the other schedulers.** A. ADIOS primarily focuses on responsiveness under heavy load (busy access), while throughput is of course not neglected. To achieve higher maximum throughput, you can set `global_latency_window` to a larger value (e.g., 72ms or 96ms on a typical HDD; SSDs or other flash drives, by contrast, usually don't require more than the default of 16ms) and test to find your preferred balance. I deliberately set a small default for this value: to emphasize the scheduler's primary strength, responsiveness.
+
 ## Build and Install
 
 1.  Clone this repository.
