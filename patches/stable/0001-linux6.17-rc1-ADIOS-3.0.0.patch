@@ -1,14 +1,14 @@
-From 4be19fe178104bd5e10e896d7371b11cc13f8482 Mon Sep 17 00:00:00 2001
+From 894bf2fa40f8d92f6845b70c938f6322776b5377 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 21 Aug 2025 07:26:56 +0900
-Subject: [PATCH] linux6.16.0-ADIOS-3.0.0-rc1
+Date: Wed, 27 Aug 2025 13:41:19 +0900
+Subject: [PATCH] linux6.17-rc1-ADIOS-3.0.0
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1887 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1877 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 1921 insertions(+), 7 deletions(-)
+ 4 files changed, 1911 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..261028321f
+index 0000000000..c76795bf3a
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1887 @@
+@@ -0,0 +1,1877 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..261028321f
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.0.0-rc1"
++#define ADIOS_VERSION "3.0.0"
 +
 +/* Request Types:
 + *
@@ -171,31 +171,6 @@ index 0000000000..261028321f
 +static u32 default_lm_shrink_at_gbytes =    50;
 +static u32 default_lm_shrink_resist    =     2;
 +
-+#define ADIOS_PQ_LEVELS 2
-+#define ADIOS_DL_TYPES  2
-+#define ADIOS_BQ_PAGES  2
-+
-+// Bit flags for the atomic state variable, indicating which queues have requests.
-+enum adios_state_flags {
-+	ADIOS_STATE_PQ_0      = 1U << 0,
-+	ADIOS_STATE_PQ_1      = 1U << 1,
-+	ADIOS_STATE_DL_0      = 1U << 2,
-+	ADIOS_STATE_DL_1      = 1U << 3,
-+	ADIOS_STATE_BQ_PAGE_0 = 1U << 4,
-+	ADIOS_STATE_BQ_PAGE_1 = 1U << 5,
-+};
-+#define ADIOS_STATE_PQ 0
-+#define ADIOS_STATE_DL 2
-+#define ADIOS_STATE_BQ 4
-+
-+// Temporal granularity of the deadline tree node (dl_group)
-+#define ADIOS_QUANTUM_SHIFT 20
-+
-+#define ADIOS_MAX_INSERTS_PER_LOCK 72
-+#define ADIOS_MAX_DELETES_PER_LOCK 24
-+
-+static u32 default_dl_prio[ADIOS_DL_TYPES] = {8, 0};
-+
 +enum adios_optype {
 +	ADIOS_READ    = 0,
 +	ADIOS_WRITE   = 1,
@@ -206,7 +181,7 @@ index 0000000000..261028321f
 +
 +// Latency targets for each operation type
 +static u64 default_latency_target[ADIOS_OPTYPES] = {
-+	[ADIOS_READ]    =     1ULL * NSEC_PER_MSEC,
++	[ADIOS_READ]    =     2ULL * NSEC_PER_MSEC,
 +	[ADIOS_WRITE]   =  2000ULL * NSEC_PER_MSEC,
 +	[ADIOS_DISCARD] =  8000ULL * NSEC_PER_MSEC,
 +	[ADIOS_OTHER]   =     0ULL * NSEC_PER_MSEC,
@@ -231,6 +206,31 @@ index 0000000000..261028321f
 +#define LM_INTERVAL_THRESHOLD   1500
 +#define LM_OUTLIER_PERCENTILE     99
 +#define LM_LAT_BUCKET_COUNT       64
++
++#define ADIOS_PQ_LEVELS 2
++#define ADIOS_DL_TYPES  2
++#define ADIOS_BQ_PAGES  2
++
++static u32 default_dl_prio[ADIOS_DL_TYPES] = {8, 0};
++
++// Bit flags for the atomic state variable, indicating which queues have requests.
++enum adios_state_flags {
++	ADIOS_STATE_PQ_0      = 1U << 0,
++	ADIOS_STATE_PQ_1      = 1U << 1,
++	ADIOS_STATE_DL_0      = 1U << 2,
++	ADIOS_STATE_DL_1      = 1U << 3,
++	ADIOS_STATE_BQ_PAGE_0 = 1U << 4,
++	ADIOS_STATE_BQ_PAGE_1 = 1U << 5,
++};
++#define ADIOS_STATE_PQ 0
++#define ADIOS_STATE_DL 2
++#define ADIOS_STATE_BQ 4
++
++// Temporal granularity of the deadline tree node (dl_group)
++#define ADIOS_QUANTUM_SHIFT 20
++
++#define ADIOS_MAX_INSERTS_PER_LOCK 72
++#define ADIOS_MAX_DELETES_PER_LOCK 24
 +
 +// Structure to hold latency bucket data for small requests
 +struct latency_bucket_small {
@@ -275,11 +275,6 @@ index 0000000000..261028321f
 +	u32 lm_shrink_at_gbytes;
 +	u8  lm_shrink_resist;
 +};
-+
-+static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
-+	struct request *rq, blk_insert_t insert_flags, struct list_head *free);
-+static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
-+	struct request *rq, blk_insert_t insert_flags, struct list_head *free);
 +
 +// Adios scheduler data
 +struct adios_data {
@@ -350,7 +345,7 @@ index 0000000000..261028321f
 +	u32 block_size;
 +} __attribute__((aligned(64)));
 +
-+static const int adios_prio_to_weight[40] = {
++static const int adios_prio_to_wmult[40] = {
 + /* -20 */     88761,     71755,     56483,     46273,     36291,
 + /* -15 */     29154,     23254,     18705,     14949,     11916,
 + /* -10 */      9548,      7620,      6100,      4904,      3906,
@@ -913,39 +908,6 @@ index 0000000000..261028321f
 +	return ret;
 +}
 +
-+// Insert a request into the scheduler (before Read & Write models stabilizes)
-+static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
-+		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
-+	struct adios_data *ad = hctx->queue->elevator->elevator_data;
-+	struct adios_rq_data *rd = get_rq_data(rq);
-+	u8 optype = adios_optype(rq);
-+	u8 pq_idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
-+	bool models_stable = false;
-+
-+	rd->block_size = blk_rq_bytes(rq);
-+	rd->pred_lat =
-+		latency_model_predict(&ad->latency_model[optype], rd->block_size);
-+
-+	if (rd->pred_lat)
-+		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
-+
-+	scoped_guard(spinlock_irqsave, &ad->pq_lock) {
-+		bool was_empty = list_empty(&ad->prio_queue[pq_idx]);
-+		list_add_tail(&rq->queuelist, &ad->prio_queue[pq_idx]);
-+		if (was_empty)
-+			set_adios_state(ad, ADIOS_STATE_PQ, pq_idx, true);
-+	}
-+
-+	rcu_read_lock();
-+	if (rcu_dereference(ad->latency_model[ADIOS_READ].params)->base > 0 &&
-+		rcu_dereference(ad->latency_model[ADIOS_WRITE].params)->base > 0)
-+			models_stable = true;
-+	rcu_read_unlock();
-+
-+	if (models_stable)
-+		ad->insert_request_fn = insert_request_post_stability;
-+}
-+
 +// Insert a request into the scheduler (after Read & Write models stabilized)
 +static void insert_request_post_stability(struct blk_mq_hw_ctx *hctx,
 +		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
@@ -995,6 +957,39 @@ index 0000000000..261028321f
 +		if (!q->last_merge)
 +			q->last_merge = rq;
 +	}
++}
++
++// Insert a request into the scheduler (before Read & Write models stabilizes)
++static void insert_request_pre_stability(struct blk_mq_hw_ctx *hctx,
++		struct request *rq, blk_insert_t insert_flags, struct list_head *free) {
++	struct adios_data *ad = hctx->queue->elevator->elevator_data;
++	struct adios_rq_data *rd = get_rq_data(rq);
++	u8 optype = adios_optype(rq);
++	u8 pq_idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
++	bool models_stable = false;
++
++	rd->block_size = blk_rq_bytes(rq);
++	rd->pred_lat =
++		latency_model_predict(&ad->latency_model[optype], rd->block_size);
++
++	if (rd->pred_lat)
++		atomic64_add(rd->pred_lat, &ad->total_pred_lat);
++
++	scoped_guard(spinlock_irqsave, &ad->pq_lock) {
++		bool was_empty = list_empty(&ad->prio_queue[pq_idx]);
++		list_add_tail(&rq->queuelist, &ad->prio_queue[pq_idx]);
++		if (was_empty)
++			set_adios_state(ad, ADIOS_STATE_PQ, pq_idx, true);
++	}
++
++	rcu_read_lock();
++	if (rcu_dereference(ad->latency_model[ADIOS_READ].params)->base > 0 &&
++		rcu_dereference(ad->latency_model[ADIOS_WRITE].params)->base > 0)
++			models_stable = true;
++	rcu_read_unlock();
++
++	if (models_stable)
++		ad->insert_request_fn = insert_request_post_stability;
 +}
 +
 +// Insert multiple requests into the scheduler
@@ -1157,7 +1152,7 @@ index 0000000000..261028321f
 +			else
 +				// Adjust the bias based on the predicted latency
 +				ad->dl_bias += sign * (s64)((rd->pred_lat *
-+					adios_prio_to_weight[ad->dl_prio[bias_idx] + 20]) >> 10);
++					adios_prio_to_wmult[ad->dl_prio[bias_idx] + 20]) >> 10);
 +		}
 +
 +		remove_request(ad, rq);
@@ -1400,23 +1395,18 @@ index 0000000000..261028321f
 +}
 +
 +// Initialize the scheduler-specific data when initializing the request queue
-+static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
++static int adios_init_sched(struct request_queue *q, struct elevator_queue *eq) {
 +	struct adios_data *ad;
-+	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
 +	u8 optype = 0;
-+
-+	eq = elevator_alloc(q, e);
-+	if (!eq) {
-+		pr_err("adios: Failed to allocate the elevator\n");
-+		return ret;
-+	}
 +
 +	ad = kzalloc_node(sizeof(*ad), GFP_KERNEL, q->node);
 +	if (!ad) {
 +		pr_err("adios: Failed to create adios_data\n");
 +		goto put_eq;
 +	}
++
++	eq->elevator_data = ad;
 +
 +	// Create a memory pool for adios_rq_data
 +	ad->rq_data_pool = kmem_cache_create("rq_data_pool",
@@ -1954,10 +1944,10 @@ index 0000000000..261028321f
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index a960bdc869..96fd08a009 100644
+index fe96c6f475..ef7339fb40 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -728,6 +728,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
@@ -1972,7 +1962,7 @@ index a960bdc869..96fd08a009 100644
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -737,13 +745,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
  	if (!e)
  		return;
  
