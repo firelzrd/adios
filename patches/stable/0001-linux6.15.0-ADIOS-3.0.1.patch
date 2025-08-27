@@ -1,14 +1,14 @@
-From f7a44207b75d921f2718f40912a96f0f819934ad Mon Sep 17 00:00:00 2001
+From 3661a74d9eb910f60cb93ce0d585fecd51a62239 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 27 Aug 2025 13:41:19 +0900
-Subject: [PATCH] linux6.15.0-ADIOS-3.0.0
+Date: Wed, 27 Aug 2025 19:44:43 +0900
+Subject: [PATCH] linux6.15.0-ADIOS-3.0.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1882 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1881 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |    5 +
- 4 files changed, 1909 insertions(+)
+ 4 files changed, 1908 insertions(+)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index 3a941dc0d2..94e3bf608b 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..3976d57fbb
+index 0000000000..83f2540c03
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1882 @@
+@@ -0,0 +1,1881 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..3976d57fbb
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.0.0"
++#define ADIOS_VERSION "3.0.1"
 +
 +/* Request Types:
 + *
@@ -924,17 +924,16 @@ index 0000000000..3976d57fbb
 +
 +	/* Tier-0: BLK_MQ_INSERT_AT_HEAD Requests
 +	 * - Needs to be processed ASAP at all costs in any case */
-+	insert_pq_flags |= !!(insert_flags & BLK_MQ_INSERT_AT_HEAD);
++	if (insert_flags & BLK_MQ_INSERT_AT_HEAD)
++	{ insert_pq_flags |= 0x2; }
 +	/* Tier-1: Integrity-sensitive Requests
 +	 * - Needs to be FIFO across all optypes */
-+	insert_pq_flags |= ((
-+		(compliant(ad, ADIOS_CF_PRIO_FUA) &
-+			!!(rq->cmd_flags & REQ_FUA)) |
-+		(compliant(ad, ADIOS_CF_PRIO_PF) &
-+			!!(rq->cmd_flags & REQ_PREFLUSH))) << 1);
++	if ((compliant(ad, ADIOS_CF_PRIO_FUA) && (rq->cmd_flags & REQ_FUA)) ||
++		(compliant(ad, ADIOS_CF_PRIO_PF ) && (rq->cmd_flags & REQ_PREFLUSH)))
++	{ insert_pq_flags |= 0x1; }
 +
 +	if (insert_pq_flags) {
-+		u8 pq_idx = insert_pq_flags >> 1;
++		u8 pq_idx = !(insert_pq_flags >> 1);
 +		if (rd->pred_lat)
 +			atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 +		scoped_guard(spinlock_irqsave, &ad->pq_lock) {

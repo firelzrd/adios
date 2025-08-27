@@ -1,14 +1,14 @@
-From 894bf2fa40f8d92f6845b70c938f6322776b5377 Mon Sep 17 00:00:00 2001
+From bd1eb73041a2f66abe7a0217e0bc6286f66d4f8d Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 27 Aug 2025 13:41:19 +0900
-Subject: [PATCH] linux6.17-rc1-ADIOS-3.0.0
+Date: Wed, 27 Aug 2025 19:44:43 +0900
+Subject: [PATCH] linux6.16.0-ADIOS-3.0.1
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1877 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1881 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 1911 insertions(+), 7 deletions(-)
+ 4 files changed, 1915 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..c76795bf3a
+index 0000000000..bcc90564b9
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1877 @@
+@@ -0,0 +1,1881 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..c76795bf3a
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.0.0"
++#define ADIOS_VERSION "3.0.1"
 +
 +/* Request Types:
 + *
@@ -924,17 +924,16 @@ index 0000000000..c76795bf3a
 +
 +	/* Tier-0: BLK_MQ_INSERT_AT_HEAD Requests
 +	 * - Needs to be processed ASAP at all costs in any case */
-+	insert_pq_flags |= !!(insert_flags & BLK_MQ_INSERT_AT_HEAD);
++	if (insert_flags & BLK_MQ_INSERT_AT_HEAD)
++	{ insert_pq_flags |= 0x2; }
 +	/* Tier-1: Integrity-sensitive Requests
 +	 * - Needs to be FIFO across all optypes */
-+	insert_pq_flags |= ((
-+		(compliant(ad, ADIOS_CF_PRIO_FUA) &
-+			!!(rq->cmd_flags & REQ_FUA)) |
-+		(compliant(ad, ADIOS_CF_PRIO_PF) &
-+			!!(rq->cmd_flags & REQ_PREFLUSH))) << 1);
++	if ((compliant(ad, ADIOS_CF_PRIO_FUA) && (rq->cmd_flags & REQ_FUA)) ||
++		(compliant(ad, ADIOS_CF_PRIO_PF ) && (rq->cmd_flags & REQ_PREFLUSH)))
++	{ insert_pq_flags |= 0x1; }
 +
 +	if (insert_pq_flags) {
-+		u8 pq_idx = insert_pq_flags >> 1;
++		u8 pq_idx = !(insert_pq_flags >> 1);
 +		if (rd->pred_lat)
 +			atomic64_add(rd->pred_lat, &ad->total_pred_lat);
 +		scoped_guard(spinlock_irqsave, &ad->pq_lock) {
@@ -1395,18 +1394,23 @@ index 0000000000..c76795bf3a
 +}
 +
 +// Initialize the scheduler-specific data when initializing the request queue
-+static int adios_init_sched(struct request_queue *q, struct elevator_queue *eq) {
++static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
 +	struct adios_data *ad;
++	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
 +	u8 optype = 0;
++
++	eq = elevator_alloc(q, e);
++	if (!eq) {
++		pr_err("adios: Failed to allocate the elevator\n");
++		return ret;
++	}
 +
 +	ad = kzalloc_node(sizeof(*ad), GFP_KERNEL, q->node);
 +	if (!ad) {
 +		pr_err("adios: Failed to create adios_data\n");
 +		goto put_eq;
 +	}
-+
-+	eq->elevator_data = ad;
 +
 +	// Create a memory pool for adios_rq_data
 +	ad->rq_data_pool = kmem_cache_create("rq_data_pool",
@@ -1944,10 +1948,10 @@ index 0000000000..c76795bf3a
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index fe96c6f475..ef7339fb40 100644
+index a960bdc869..96fd08a009 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -728,6 +728,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
@@ -1962,7 +1966,7 @@ index fe96c6f475..ef7339fb40 100644
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -737,13 +745,10 @@ void elevator_set_default(struct request_queue *q)
  	if (!e)
  		return;
  
