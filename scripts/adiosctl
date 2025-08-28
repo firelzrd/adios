@@ -75,7 +75,10 @@ def fetch_adios_data(dev)
   iosched_dir = dev_q_iosched_path(dev)
   data = {}
   Dir.entries(iosched_dir).each do |file|
-    next if file.start_with?('.')
+    # Skip dotfiles and write-only trigger files (e.g., reset_*) which
+    # cannot be read even by the root user, preventing permission errors.
+    next if file.start_with?('.', 'reset_')
+
     param_path = File.join(iosched_dir, file)
     next unless File.file?(param_path) && File.readable?(param_path)
     data[file] = File.read(param_path)
