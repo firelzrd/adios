@@ -342,28 +342,29 @@ def print_usage
   puts <<~USAGE
     adiosctl - ADIOS I/O Scheduler Management Utility
 
-    Usage: #{$0} <command> [arguments...]
+    Usage: adiosctl <command> [arguments...]
 
     Commands:
       list
         List block devices currently using the ADIOS scheduler.
-        Example: #{$0} list
+        Example: adiosctl list
 
       show <device> [-h | --human-readable]
-        Show ADIOS parameters for a device. With -h, shows a structured view.
-        Example: #{$0} show nvme0n1 -h
+        Show ADIOS parameters for a device.
+        With -h, shows a structured, human-readable view.
+        Example: adiosctl show nvme0n1 -h
 
       get <device> <parameter>
         Get the current value of a specific parameter.
-        Example: #{$0} get sda global_latency_window
+        Example: adiosctl get sda global_latency_window
 
       set <device> <parameter> <value>
         Set a new value for a parameter. Requires root privileges.
-        Example: sudo #{$0} set sda read_priority 7
+        Example: sudo adiosctl set sda read_priority 7
       
       dump <device> lat_model
         Dump current latency model parameters in a format for 'reset'.
-        Example: #{$0} dump nvme0n1 lat_model
+        Example: adiosctl dump nvme0n1 lat_model
 
       reset <device> [<target>] [args...]
         Reset statistics or load model parameters. Requires root privileges.
@@ -372,16 +373,17 @@ def print_usage
         Targets:
           bq_stats
             Resets batch queue statistics.
-            Example: sudo #{$0} reset sda bq_stats
+            Example: sudo adiosctl reset sda bq_stats
 
           lat_model
-            With no arguments, resets the latency model to internal defaults.
-            Example: sudo #{$0} reset sda lat_model
+            With no arguments, resets the latency model to its
+            internal defaults.
+            Example: sudo adiosctl reset sda lat_model
 
-            With 6 arguments, sideloads new parameters into the latency
-            models for read (r), write (w), and discard (d).
+            With 6 arguments, sideloads new parameters into the
+            latency models for read (r), write (w), and discard (d).
             Format:  <r_base> <r_slope> <w_base> <w_slope> <d_base> <d_slope>
-            Example: sudo #{$0} reset sda lat_model \\
+            Example: sudo adiosctl reset sda lat_model \\
               100000 1000 150000 1200 500000 0
   USAGE
 end
