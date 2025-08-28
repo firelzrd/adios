@@ -1,0 +1,387 @@
+#!/usr/bin/env ruby
+#
+# adiosctl - Utility to manage the ADIOS I/O scheduler parameters.
+#
+
+# --- Constants ---
+# Base path for block device sysfs entries
+SYSFS_BLOCK_PATH = "/sys/block".freeze
+NSEC_PER_MSEC = 1_000_000.0
+
+# From adios.c: adios_prio_to_wmult array
+# Maps nice values (-20 to 19) to scheduler cost multipliers.
+# The array index is calculated as `priority + 20`. A higher priority
+# value results in a *smaller* cost multiplier.
+ADIOS_PRIO_TO_WMULT = [
+  88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+   9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+   1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
+    110,    87,    70,    56,    45,    36,    29,    23,    18,    15
+].freeze
+
+# --- Helper Functions for Path Construction ---
+
+def dev_q_iosched_path(dev)
+  File.join(SYSFS_BLOCK_PATH, dev, "queue", "iosched")
+end
+
+def path_to_dev_name(path)
+  path.match(%r{/sys/block/([^/]+)}) ? $1 : nil
+end
+
+# --- Helper Functions for Device Operations ---
+
+def list_adios_devices
+  adios_version_files = File.join(SYSFS_BLOCK_PATH, "*", "queue", "iosched", "adios_version")
+  Dir[adios_version_files].map { |path| path_to_dev_name(path) }.compact.sort
+end
+
+def check_device_validity(dev)
+  unless Dir.exist?(File.join(SYSFS_BLOCK_PATH, dev))
+    STDERR.puts "Error: Device '#{dev}' not found."
+    exit 1
+  end
+
+  adios_marker = File.join(dev_q_iosched_path(dev), "adios_version")
+  unless File.exist?(adios_marker)
+    sched_file = File.join(SYSFS_BLOCK_PATH, dev, "queue", "scheduler")
+    if File.exist?(sched_file)
+      current_sched = File.read(sched_file).match(/\[([^\]]+)\]/)[1] rescue "unknown"
+      STDERR.puts "Error: Device '#{dev}' is using '#{current_sched}' scheduler, not 'adios'."
+      STDERR.puts "Hint: Set ADIOS scheduler with: echo adios > #{sched_file}"
+    else
+      STDERR.puts "Error: Cannot determine I/O scheduler for device '#{dev}'."
+    end
+    exit 1
+  end
+end
+
+def ensure_root_privileges
+  unless Process.uid == 0
+    STDERR.puts "Error: This operation requires root privileges (try running with sudo)."
+    exit 1
+  end
+end
+
+# --- Subcommand Implementations ---
+
+def handle_list
+  devices = list_adios_devices
+  puts devices.join(' ')
+end
+
+# Fetches all ADIOS parameters for a device into a hash.
+def fetch_adios_data(dev)
+  iosched_dir = dev_q_iosched_path(dev)
+  data = {}
+  Dir.entries(iosched_dir).each do |file|
+    next if file.start_with?('.')
+    param_path = File.join(iosched_dir, file)
+    next unless File.file?(param_path) && File.readable?(param_path)
+    data[file] = File.read(param_path)
+  end
+  data
+end
+
+# Formats nanoseconds to a more readable ms string.
+def format_ns(ns_str)
+  ns = ns_str.to_i
+  "%.3f ms" % (ns / NSEC_PER_MSEC)
+end
+
+# Displays parameters in a structured, human-readable format.
+def display_human_readable_info(dev)
+  data = fetch_adios_data(dev)
+  puts "ADIOS Parameters for #{dev} (v#{data['adios_version']&.chomp})"
+  puts "=" * 50
+
+  puts "\n[ General Settings ]"
+  puts "  Global Latency Window : #{format_ns(data['global_latency_window'])}"
+  order = data['batch_order']&.chomp == '0' ? "OPTYPE (per Read/Write/Discard)" : "ELEVATOR (Sync/Async)"
+  puts "  Batch Order           : #{data['batch_order']&.chomp} (#{order})"
+  puts "  Batch Refill Ratio    : #{data['bq_refill_below_ratio']&.chomp}%"
+
+  puts "\n[ Latency Model & Targets ]"
+  printf "  %-10s | %-15s | %-15s | %-15s\n", "Type", "Target Latency", "Base Latency", "Slope"
+  puts "  " + "-" * 62
+  ['read', 'write', 'discard'].each do |op|
+    target = format_ns(data["lat_target_#{op}"])
+    model_data = data["lat_model_#{op}"]
+    base = "N/A"
+    slope = "N/A"
+    if model_data
+      base_match = model_data.match(/base\s*:\s*(\d+)\s*ns/)
+      slope_match = model_data.match(/slope\s*:\s*(\d+)\s*ns\/KiB/)
+      base = base_match ? format_ns(base_match[1]) : "N/A"
+      slope = slope_match ? "#{slope_match[1]} ns/KiB" : "N/A"
+    end
+    printf "  %-10s | %-15s | %-15s | %-15s\n", op.capitalize, target, base, slope
+  end
+
+  puts "\n[ Batching ]"
+  actuals = {}
+  data['batch_actual_max']&.lines&.each do |line|
+    key, val = line.split(':', 2).map(&:strip)
+    actuals[key.downcase.gsub(/\s+/, '')] = val # 'Total  ' -> 'total'
+  end
+  puts "  Batch Size (Requests):"
+  printf "    %-10s | %-10s | %-15s\n", "Type", "Limit", "Observed Peak"
+  puts "    " + "-" * 40
+  ['read', 'write', 'discard'].each do |op|
+    limit = data["batch_limit_#{op}"]&.chomp || 'N/A'
+    observed = actuals[op] || 'N/A'
+    printf "    %-10s | %-10s | %-15s\n", op.capitalize, limit, observed
+  end
+  printf "    %-10s | %-10s | %-15s\n", "Total", "N/A", actuals['total'] || 'N/A'
+
+
+  puts "\n[ Priority & Compliance ]"
+  prio = data['read_priority']&.chomp.to_i
+  read_cost_multiplier = ADIOS_PRIO_TO_WMULT[prio + 20]
+  write_cost_multiplier = ADIOS_PRIO_TO_WMULT[0 + 20]
+  priority_ratio = write_cost_multiplier.to_f / read_cost_multiplier.to_f
+  puts "  Read Priority         : #{prio} (Weight Ratio: %.2f : 1)" % priority_ratio
+
+  flags = data['compliance_flags']&.to_i || 0
+  puts "  Compliance Flags      : #{sprintf("0x%x", flags)}"
+  flag_map = {
+    0x1 => "Prioritize REQ_FUA as Tier-1",
+    0x2 => "Prioritize REQ_PREFLUSH as Tier-1",
+    0x4 => "Disable reordering of async I/O by deadline"
+  }
+  flag_map.each do |bit, desc|
+    status = (flags & bit).nonzero? ? '[✓]' : '[ ]'
+    hex_val = sprintf("0x%-2x", bit)
+    puts "    #{status} #{hex_val} : #{desc}"
+  end
+
+  puts "\n[ Model Learning Control ]"
+  puts "  Latency Sample Limit  : #{format_ns(data['lat_model_latency_limit'])}"
+  puts "  Model Shrink At (KReqs) : #{data['shrink_at_kreqs']&.chomp} kreqs"
+  puts "  Model Shrink At (GB)    : #{data['shrink_at_gbytes']&.chomp} GB"
+  puts "  Model Shrink Resist   : #{data['shrink_resist']&.chomp}"
+end
+
+# Displays parameters in raw key:value format.
+def display_raw_info(dev)
+  iosched_dir = dev_q_iosched_path(dev)
+  files = Dir.entries(iosched_dir)
+             .reject { |f| f.start_with?('.', 'reset_') }
+             .sort
+  files.each do |file|
+    param_path = File.join(iosched_dir, file)
+    next unless File.file?(param_path)
+    begin
+      lines = File.read(param_path).lines.map(&:chomp)
+      lines.each { |line| puts "#{file}:#{line}" }
+    rescue => e
+      STDERR.puts "Warning: Error reading parameter '#{file}': #{e.message}"
+    end
+  end
+end
+
+def handle_show(args)
+  human_readable = args.any? { |arg| ['-h', '--human-readable'].include?(arg) }
+  dev_args = args.reject { |arg| ['-h', '--human-readable'].include?(arg) }
+
+  if dev_args.length != 1
+    STDERR.puts "Error: 'show' command requires exactly one device name."
+    print_usage
+    exit 1
+  end
+  dev = dev_args.first
+  check_device_validity(dev)
+
+  if human_readable
+    display_human_readable_info(dev)
+  else
+    display_raw_info(dev)
+  end
+end
+
+def handle_get(dev, parameter)
+  check_device_validity(dev)
+  param_path = File.join(dev_q_iosched_path(dev), parameter)
+  unless File.exist?(param_path)
+    STDERR.puts "Error: Parameter '#{parameter}' not found for device '#{dev}'."
+    exit 1
+  end
+  begin
+    puts File.read(param_path).chomp
+  rescue => e
+    STDERR.puts "Error reading parameter: #{e.message}"
+    exit 1
+  end
+end
+
+def handle_set(dev, parameter, value)
+  ensure_root_privileges
+  check_device_validity(dev)
+  param_path = File.join(dev_q_iosched_path(dev), parameter)
+  unless File.exist?(param_path)
+    STDERR.puts "Error: Parameter '#{parameter}' not found for device '#{dev}'."
+    exit 1
+  end
+  begin
+    File.write(param_path, value.to_s + "\n")
+    puts File.read(param_path).chomp
+  rescue => e
+    STDERR.puts "Error setting parameter: #{e.message}"
+    exit 1
+  end
+end
+
+def handle_reset(args)
+  ensure_root_privileges
+  dev = args.shift
+  if dev.nil?
+    STDERR.puts "Error: Missing <device> for 'reset' command."
+    print_usage
+    exit 1
+  end
+  check_device_validity(dev)
+  target = args.shift
+  iosched_dir = dev_q_iosched_path(dev)
+  if target.nil?
+    puts "Resetting all parameters for device '#{dev}'..."
+    begin
+      File.write(File.join(iosched_dir, "reset_bq_stats"), "1")
+      puts " -> Batch queue statistics reset successfully."
+    rescue => e
+      STDERR.puts " -> Failed to reset bq_stats: #{e.message}"
+    end
+    begin
+      File.write(File.join(iosched_dir, "reset_lat_model"), "1")
+      puts " -> Latency models reset successfully."
+    rescue => e
+      STDERR.puts " -> Failed to reset lat_model: #{e.message}"
+    end
+    return
+  end
+  case target
+  when "bq_stats"
+    if args.any?
+      STDERR.puts "Warning: 'reset bq_stats' takes no extra arguments. Ignoring."
+    end
+    param_path = File.join(iosched_dir, "reset_bq_stats")
+    write_value = "1"
+  when "lat_model"
+    param_path = File.join(iosched_dir, "reset_lat_model")
+    if args.empty?
+      write_value = "1"
+    elsif args.length == 6
+      unless args.all? { |arg| arg.match?(/^\d+$/) }
+        STDERR.puts "Error: Latency model parameters must be non-negative integers."
+        print_usage
+        exit 1
+      end
+      write_value = args.join(' ')
+    else
+      STDERR.puts "Error: 'reset lat_model' requires either 0 or 6 arguments."
+      print_usage
+      exit 1
+    end
+  else
+    STDERR.puts "Error: Unknown reset target '#{target}'. Valid targets are 'bq_stats' or 'lat_model'."
+    exit 1
+  end
+  begin
+    File.write(param_path, write_value)
+    puts "Reset successful for '#{target}' on device '#{dev}'."
+  rescue => e
+    STDERR.puts "Error during reset operation: #{e.message}"
+    exit 1
+  end
+end
+
+# --- Main Dispatch Logic ---
+
+def print_usage
+  puts <<~USAGE
+    adiosctl - ADIOS I/O Scheduler Management Utility
+
+    Usage: #{$0} <command> [arguments...]
+
+    Commands:
+      list
+        List block devices currently using the ADIOS scheduler.
+        Example: #{$0} list
+
+      show <device> [-h | --human-readable]
+        Show ADIOS parameters for a device. With -h, shows a structured view.
+        Example: #{$0} show nvme0n1 -h
+
+      get <device> <parameter>
+        Get the current value of a specific parameter.
+        Example: #{$0} get sda global_latency_window
+
+      set <device> <parameter> <value>
+        Set a new value for a parameter. Requires root privileges.
+        Example: sudo #{$0} set sda read_priority 7
+
+      reset <device> [<target>] [args...]
+        Reset statistics or load model parameters. Requires root privileges.
+        If <target> is omitted, all parameters for the device are reset.
+        
+        Targets:
+          bq_stats
+            Resets batch queue statistics.
+            Example: sudo #{$0} reset sda bq_stats
+
+          lat_model
+            With no arguments, resets the latency model to internal defaults.
+            Example: sudo #{$0} reset sda lat_model
+
+            With 6 arguments, sideloads new parameters into the latency
+            models for read (r), write (w), and discard (d).
+            Format:  <r_base> <r_slope> <w_base> <w_slope> <d_base> <d_slope>
+            Example: sudo #{$0} reset sda lat_model \\
+              100000 1000 150000 1200 500000 0
+  USAGE
+end
+
+def main
+  command = ARGV.shift
+
+  case command
+  when "list"
+    handle_list if ARGV.empty?
+  when "show"
+    handle_show(ARGV)
+  when "get"
+    handle_get(ARGV[0], ARGV[1]) if ARGV.length == 2
+  when "set"
+    handle_set(ARGV[0], ARGV[1], ARGV[2]) if ARGV.length == 3
+  when "reset"
+    handle_reset(ARGV)
+  when "-h", "--help"
+    print_usage
+    exit 0
+  when nil
+    STDERR.puts "Error: No command specified."
+    print_usage
+    exit 1
+  else
+    STDERR.puts "Error: Unknown command '#{command}'."
+    print_usage
+    exit 1
+  end
+
+  fixed_arg_commands = ["list", "get", "set"]
+  if fixed_arg_commands.include?(command)
+    expected_args_count = case command
+                          when "list" then 0
+                          when "get"  then 2
+                          when "set"  then 3
+                          end
+    if expected_args_count && ARGV.length != expected_args_count
+      STDERR.puts "Error: Incorrect number of arguments for command '#{command}'."
+      print_usage
+      exit 1
+    end
+  end
+end
+
+if __FILE__ == $0
+  main
+end
