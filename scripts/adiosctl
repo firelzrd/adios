@@ -294,6 +294,48 @@ def handle_reset(args)
   end
 end
 
+# Dumps latency model parameters for later use with 'reset'.
+def handle_dump(args)
+  if args.length != 2
+    STDERR.puts "Error: 'dump' command requires <device> and <target>."
+    print_usage
+    exit 1
+  end
+
+  dev, target = args
+
+  unless target == "lat_model"
+    STDERR.puts "Error: Unknown dump target '#{target}'. Only 'lat_model' is supported."
+    exit 1
+  end
+
+  check_device_validity(dev)
+  data = fetch_adios_data(dev)
+
+  params = []
+  ['read', 'write', 'discard'].each do |op|
+    model_data = data["lat_model_#{op}"]
+    if model_data.nil?
+      STDERR.puts "Error: Could not read lat_model_#{op} for device '#{dev}'."
+      exit 1
+    end
+
+    base_match = model_data.match(/base\s*:\s*(\d+)\s*ns/)
+    slope_match = model_data.match(/slope\s*:\s*(\d+)\s*ns\/KiB/)
+
+    if base_match && slope_match
+      params << base_match[1]
+      params << slope_match[1]
+    else
+      STDERR.puts "Error: Failed to parse lat_model_#{op} data."
+      STDERR.puts "Data: #{model_data.inspect}"
+      exit 1
+    end
+  end
+
+  puts params.join(' ')
+end
+
 # --- Main Dispatch Logic ---
 
 def print_usage
@@ -318,6 +360,10 @@ def print_usage
       set <device> <parameter> <value>
         Set a new value for a parameter. Requires root privileges.
         Example: sudo #{$0} set sda read_priority 7
+      
+      dump <device> lat_model
+        Dump current latency model parameters in a format for 'reset'.
+        Example: #{$0} dump nvme0n1 lat_model
 
       reset <device> [<target>] [args...]
         Reset statistics or load model parameters. Requires root privileges.
@@ -354,6 +400,8 @@ def main
     handle_set(ARGV[0], ARGV[1], ARGV[2]) if ARGV.length == 3
   when "reset"
     handle_reset(ARGV)
+  when "dump"
+    handle_dump(ARGV)
   when "-h", "--help"
     print_usage
     exit 0
@@ -367,12 +415,13 @@ def main
     exit 1
   end
 
-  fixed_arg_commands = ["list", "get", "set"]
+  fixed_arg_commands = ["list", "get", "set", "dump"]
   if fixed_arg_commands.include?(command)
     expected_args_count = case command
                           when "list" then 0
                           when "get"  then 2
                           when "set"  then 3
+                          when "dump" then 2
                           end
     if expected_args_count && ARGV.length != expected_args_count
       STDERR.puts "Error: Incorrect number of arguments for command '#{command}'."
