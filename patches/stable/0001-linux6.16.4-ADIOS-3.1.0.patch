@@ -1,14 +1,14 @@
-From d651423e9b4427512b65c09bc60f5ae538bd4a66 Mon Sep 17 00:00:00 2001
+From cc821037414d80281e0238d089d0e38afaf3c66f Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
 Date: Mon, 1 Sep 2025 13:35:32 +0900
-Subject: [PATCH] linux6.16.0-ADIOS-3.1.0
+Subject: [PATCH] linux6.16.4-ADIOS-3.1.0
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1982 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1977 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 2016 insertions(+), 7 deletions(-)
+ 4 files changed, 2011 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..ecbe23e696
+index 0000000000..4689c19662
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1982 @@
+@@ -0,0 +1,1977 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -1492,23 +1492,18 @@ index 0000000000..ecbe23e696
 +}
 +
 +// Initialize the scheduler-specific data when initializing the request queue
-+static int adios_init_sched(struct request_queue *q, struct elevator_type *e) {
++static int adios_init_sched(struct request_queue *q, struct elevator_queue *eq) {
 +	struct adios_data *ad;
-+	struct elevator_queue *eq;
 +	int ret = -ENOMEM;
 +	u8 optype = 0;
-+
-+	eq = elevator_alloc(q, e);
-+	if (!eq) {
-+		pr_err("adios: Failed to allocate the elevator\n");
-+		return ret;
-+	}
 +
 +	ad = kzalloc_node(sizeof(*ad), GFP_KERNEL, q->node);
 +	if (!ad) {
 +		pr_err("adios: Failed to create adios_data\n");
 +		goto put_eq;
 +	}
++
++	eq->elevator_data = ad;
 +
 +	// Create a memory pool for adios_rq_data
 +	ad->rq_data_pool = kmem_cache_create("rq_data_pool",
@@ -2049,10 +2044,10 @@ index 0000000000..ecbe23e696
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index a960bdc869..96fd08a009 100644
+index fe96c6f475..ef7339fb40 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -728,6 +728,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
@@ -2067,7 +2062,7 @@ index a960bdc869..96fd08a009 100644
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -737,13 +745,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
  	if (!e)
  		return;
  
