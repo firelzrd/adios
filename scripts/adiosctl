@@ -148,9 +148,7 @@ def display_human_readable_info(dev)
   flags = data['compliance_flags']&.to_i || 0
   puts "  Compliance Flags      : #{sprintf("0x%x", flags)}"
   flag_map = {
-    0x1 => "Prioritize REQ_FUA as Tier-1",
-    0x2 => "Prioritize REQ_PREFLUSH as Tier-1",
-    0x4 => "Disable reordering of async I/O by deadline"
+    0x1 => "Disable reordering of async I/O by deadline"
   }
   flag_map.each do |bit, desc|
     status = (flags & bit).nonzero? ? '[✓]' : '[ ]'
@@ -363,7 +361,7 @@ def print_usage
 
       set <device> <parameter> <value>
         Set a new value for a parameter. Requires root privileges.
-        Example: sudo adiosctl set sda read_priority 7
+        Example: sudo adiosctl set sda compliance_flags 3
       
       dump <device> lat_model
         Dump current latency model parameters in a format for 'reset'.
