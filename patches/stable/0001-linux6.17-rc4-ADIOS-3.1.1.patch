@@ -1,7 +1,7 @@
-From cc821037414d80281e0238d089d0e38afaf3c66f Mon Sep 17 00:00:00 2001
+From a5014a9086e3a57000c05141ac0d659dd90ac969 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Mon, 1 Sep 2025 13:35:32 +0900
-Subject: [PATCH] linux6.16.4-ADIOS-3.1.0
+Date: Wed, 3 Sep 2025 10:57:13 +0900
+Subject: [PATCH] linux6.17-rc4-ADIOS-3.1.1
 
 ---
  block/Kconfig.iosched |   14 +
@@ -61,7 +61,7 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..4689c19662
+index 0000000000..3d7fe122e2
 --- /dev/null
 +++ b/block/adios.c
 @@ -0,0 +1,1977 @@
@@ -92,7 +92,7 @@ index 0000000000..4689c19662
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.1.0"
++#define ADIOS_VERSION "3.1.1"
 +
 +/* Request Types:
 + *
@@ -156,7 +156,7 @@ index 0000000000..4689c19662
 +// Batch ordering strategy
 +static u64 default_batch_order = 0;
 +// Flags to control compliance with block layer constraints
-+static u64 default_compliance_flags = 0x1;
++static u64 default_compliance_flags = 0x0;
 +
 +/* Compliance Flags:
 + * 0x4: Async requests will not be reordered based on the predicted latency
@@ -1239,7 +1239,7 @@ index 0000000000..4689c19662
 +	if (!bq_state) return NULL;
 +
 +	struct request *rq;
-+	u32 bq_idx = 31 - __builtin_clz(bq_state);
++	u32 bq_idx = __builtin_ctz(bq_state);
 +
 +	// Dispatch based on optype (FIFO within each) or single-queue elevator
 +	rq = pop_bq_request(ad, bq_idx, false);
@@ -1251,7 +1251,7 @@ index 0000000000..4689c19662
 +	if (!bq_state) return NULL;
 +
 +	struct request *rq;
-+	u32 bq_idx = 31 - __builtin_clz(bq_state);
++	u32 bq_idx = __builtin_ctz(bq_state);
 +	bool direction = (bq_idx == 1) & ad->elv_direction;
 +
 +	// Tier-2 (sync) is always high priority
