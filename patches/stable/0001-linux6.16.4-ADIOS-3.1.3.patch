@@ -1,14 +1,14 @@
-From 827298627dd72220c46a335f0d414939fe90c1ac Mon Sep 17 00:00:00 2001
+From 680bf6ffbd055eafcb0b975e981cb746f9a6b1cc Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Wed, 3 Sep 2025 15:20:24 +0900
-Subject: [PATCH] linux6.17-rc4-ADIOS-3.1.2
+Date: Thu, 4 Sep 2025 16:47:10 +0900
+Subject: [PATCH] linux6.16.4-ADIOS-3.1.3
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 1978 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 1977 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 2012 insertions(+), 7 deletions(-)
+ 4 files changed, 2011 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..506612706b
+index 0000000000..3372043245
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,1978 @@
+@@ -0,0 +1,1977 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..506612706b
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.1.2"
++#define ADIOS_VERSION "3.1.3"
 +
 +/* Request Types:
 + *
@@ -1332,9 +1332,6 @@ index 0000000000..506612706b
 +}
 +
 +static bool release_barrier_requests(struct adios_data *ad) {
-+	if (!eval_adios_state(ad, ADIOS_STATE_BP))
-+		return false;
-+
 +	u32 moved_count = 0;
 +	LIST_HEAD(local_list);
 +
@@ -1404,7 +1401,9 @@ index 0000000000..506612706b
 +	 * This is the trigger to release requests that were held in barrier_queue
 +	 * due to a REQ_OP_FLUSH barrier.
 +	 */
-+	if (release_barrier_requests(ad))
++	if (eval_adios_state(ad, ADIOS_STATE_BP) &&
++			atomic64_read(&ad->total_pred_lat) == 0 &&
++			release_barrier_requests(ad))
 +		goto retry;
 +
 +	return NULL;
