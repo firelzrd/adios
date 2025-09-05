@@ -1,14 +1,14 @@
-From 051a1acb92489290a08f3c89f6439729f234ffb0 Mon Sep 17 00:00:00 2001
+From 5bcf33baf9d19d99509ab820fbada3784d935a0a Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Thu, 4 Sep 2025 18:07:26 +0900
-Subject: [PATCH] linux6.16.4-ADIOS-3.1.4
+Date: Fri, 5 Sep 2025 23:50:23 +0900
+Subject: [PATCH] linux6.16.4-ADIOS-3.1.5
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 2010 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 2011 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 2044 insertions(+), 7 deletions(-)
+ 4 files changed, 2045 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..201e5be610
+index 0000000000..db84118356
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2010 @@
+@@ -0,0 +1,2011 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..201e5be610
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.1.4"
++#define ADIOS_VERSION "3.1.5"
 +
 +/* Request Types:
 + *
@@ -164,7 +164,8 @@ index 0000000000..201e5be610
 +};
 +
 +// Flags to control compliance with block layer constraints
-+static u64 default_compliance_flags = 0x0;
++static u64 default_compliance_flags =
++	ADIOS_CF_FIXORDER;
 +
 +// Dynamic thresholds for shrinkage
 +static u32 default_lm_shrink_at_kreqs  =  5000;
