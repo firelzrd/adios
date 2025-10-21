@@ -1,14 +1,14 @@
-From d65223a24c49745add694042590b5705e91a388e Mon Sep 17 00:00:00 2001
+From 2dcb900c6ea005a99e196a78946f10a80ebd597a Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sat, 6 Sep 2025 21:22:39 +0900
-Subject: [PATCH] linux6.16.4-ADIOS-3.1.6
+Date: Mon, 20 Oct 2025 16:42:48 +0900
+Subject: [PATCH] linux6.17.4-ADIOS-3.1.7
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 2015 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 2006 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 2049 insertions(+), 7 deletions(-)
+ 4 files changed, 2040 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..318505265d
+index 0000000000..41de52785c
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2015 @@
+@@ -0,0 +1,2006 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..318505265d
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.1.6"
++#define ADIOS_VERSION "3.1.7"
 +
 +/* Request Types:
 + *
@@ -877,14 +877,11 @@ index 0000000000..318505265d
 +}
 +
 +// The number of requests in the queue was notified from the block layer
-+static void adios_depth_updated(struct blk_mq_hw_ctx *hctx) {
-+	struct request_queue *q = hctx->queue;
++static void adios_depth_updated(struct request_queue *q) {
 +	struct adios_data *ad = q->elevator->elevator_data;
-+	struct blk_mq_tags *tags = hctx->sched_tags;
 +
 +	ad->async_depth = q->nr_requests;
-+
-+	sbitmap_queue_min_shallow_depth(&tags->bitmap_tags, 1);
++	blk_mq_set_min_shallow_depth(q, 1);
 +}
 +
 +// Handle request merging after a merge operation
@@ -1523,12 +1520,6 @@ index 0000000000..318505265d
 +	return atomic_read(&ad->state) != 0;
 +}
 +
-+// Initialize the scheduler-specific data for a hardware queue
-+static int adios_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx) {
-+	adios_depth_updated(hctx);
-+	return 0;
-+}
-+
 +// Initialize the scheduler-specific data when initializing the request queue
 +static int adios_init_sched(struct request_queue *q, struct elevator_queue *eq) {
 +	struct adios_data *ad;
@@ -1640,6 +1631,7 @@ index 0000000000..318505265d
 +	blk_stat_enable_accounting(q);
 +
 +	q->elevator = eq;
++	adios_depth_updated(q);
 +	return 0;
 +
 +free_buckets:
@@ -2049,7 +2041,6 @@ index 0000000000..318505265d
 +		.completed_request	= adios_completed_request,
 +		.finish_request		= adios_finish_request,
 +		.has_work			= adios_has_work,
-+		.init_hctx			= adios_init_hctx,
 +		.init_sched			= adios_init_sched,
 +		.exit_sched			= adios_exit_sched,
 +	},
@@ -2082,10 +2073,10 @@ index 0000000000..318505265d
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index fe96c6f475..ef7339fb40 100644
+index e2ebfbf107..eafb9c116d 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -752,6 +752,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -753,6 +753,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
@@ -2100,7 +2091,7 @@ index fe96c6f475..ef7339fb40 100644
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -761,13 +769,10 @@ void elevator_set_default(struct request_queue *q)
+@@ -762,13 +770,10 @@ void elevator_set_default(struct request_queue *q)
  	if (!e)
  		return;
  
