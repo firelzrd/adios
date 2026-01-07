@@ -1,7 +1,7 @@
-From 81e924cc6ee3eefafee145c4b7eb4996b5394cfe Mon Sep 17 00:00:00 2001
+From 528a2045f24a16f22c7cc3f028c5fd480d128e9c Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 28 Dec 2025 05:00:46 +0900
-Subject: [PATCH] linux6.18.2-ADIOS-3.1.8
+Date: Sun, 28 Dec 2025 04:29:20 +0900
+Subject: [PATCH] linux6.18.3-ADIOS-3.1.8
 
 ---
  block/Kconfig.iosched |   14 +
@@ -2069,10 +2069,10 @@ index 0000000000..c6eaa85911
 +MODULE_DESCRIPTION(ADIOS_PROGNAME);
 \ No newline at end of file
 diff --git a/block/elevator.c b/block/elevator.c
-index e2ebfbf107..eafb9c116d 100644
+index a2f8b2251d..3867946599 100644
 --- a/block/elevator.c
 +++ b/block/elevator.c
-@@ -753,6 +753,14 @@ void elevator_set_default(struct request_queue *q)
+@@ -739,6 +739,14 @@ void elevator_set_default(struct request_queue *q)
  	if (q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
  		return;
  
@@ -2087,8 +2087,8 @@ index e2ebfbf107..eafb9c116d 100644
  	/*
  	 * For single queue devices, default to using mq-deadline. If we
  	 * have multiple queues or mq-deadline is not available, default
-@@ -762,13 +770,10 @@ void elevator_set_default(struct request_queue *q)
- 	if (!e)
+@@ -748,13 +756,10 @@ void elevator_set_default(struct request_queue *q)
+ 	if (!ctx.type)
  		return;
  
 -	if ((q->nr_hw_queues == 1 ||
@@ -2102,7 +2102,7 @@ index e2ebfbf107..eafb9c116d 100644
 +	if (err < 0)
 +		pr_warn("\"%s\" elevator initialization, failed %d, falling back to \"none\"\n",
 +				ctx.name, err);
- 	elevator_put(e);
+ 	elevator_put(ctx.type);
  }
  
 -- 
