@@ -1,14 +1,14 @@
-From f33374488a2b57f0ac4b1050e40a646ba69ea868 Mon Sep 17 00:00:00 2001
+From ffc090b8d504b5bc66e16d430c55e95faea69c32 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Sun, 28 Dec 2025 04:29:20 +0900
-Subject: [PATCH] linux6.19-rc1-ADIOS-3.1.8
+Date: Tue, 3 Feb 2026 02:56:49 +0900
+Subject: [PATCH] linux6.19-rc1-ADIOS-3.1.9
 
 ---
  block/Kconfig.iosched |   14 +
  block/Makefile        |    8 +
- block/adios.c         | 2002 +++++++++++++++++++++++++++++++++++++++++
+ block/adios.c         | 2004 +++++++++++++++++++++++++++++++++++++++++
  block/elevator.c      |   19 +-
- 4 files changed, 2036 insertions(+), 7 deletions(-)
+ 4 files changed, 2038 insertions(+), 7 deletions(-)
  create mode 100644 block/adios.c
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
@@ -61,10 +61,10 @@ index c65f4da937..105b12fd86 100644
 +
 diff --git a/block/adios.c b/block/adios.c
 new file mode 100644
-index 0000000000..c6eaa85911
+index 0000000000..6ae4bce224
 --- /dev/null
 +++ b/block/adios.c
-@@ -0,0 +1,2002 @@
+@@ -0,0 +1,2004 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Adaptive Deadline I/O Scheduler (ADIOS)
@@ -92,7 +92,7 @@ index 0000000000..c6eaa85911
 +#include "blk-mq.h"
 +#include "blk-mq-sched.h"
 +
-+#define ADIOS_VERSION "3.1.8"
++#define ADIOS_VERSION "3.1.9"
 +
 +/* Request Types:
 + *
@@ -300,8 +300,7 @@ index 0000000000..c6eaa85911
 +	atomic_t state;
 +	u8  bq_state[ADIOS_BQ_PAGES];
 +
-+	void (*insert_request_fn)(struct blk_mq_hw_ctx *, struct request *,
-+								blk_insert_t, struct list_head *);
++	bool models_stable;
 +
 +	u64 global_latency_window;
 +	u64 compliance_flags;
@@ -1013,7 +1012,7 @@ index 0000000000..c6eaa85911
 +	struct adios_rq_data *rd = get_rq_data(rq);
 +	u8 optype = adios_optype(rq);
 +	u8 pq_idx = !(insert_flags & BLK_MQ_INSERT_AT_HEAD);
-+	bool models_stable = false;
++	bool stable = false;
 +
 +	rd->managed = true;
 +	rd->block_size = blk_rq_bytes(rq);
@@ -1025,11 +1024,11 @@ index 0000000000..c6eaa85911
 +	rcu_read_lock();
 +	if (rcu_dereference(ad->latency_model[ADIOS_READ].params)->base > 0 &&
 +		rcu_dereference(ad->latency_model[ADIOS_WRITE].params)->base > 0)
-+			models_stable = true;
++			stable = true;
 +	rcu_read_unlock();
 +
-+	if (models_stable)
-+		ad->insert_request_fn = insert_request_post_stability;
++	if (stable)
++		ad->models_stable = true;
 +}
 +
 +// Insert multiple requests into the scheduler
@@ -1051,7 +1050,10 @@ index 0000000000..c6eaa85911
 +		}
 +		rq = list_first_entry(list, struct request, queuelist);
 +		list_del_init(&rq->queuelist);
-+		ad->insert_request_fn(hctx, rq, insert_flags, &free);
++		if (likely(ad->models_stable))
++			insert_request_post_stability(hctx, rq, insert_flags, &free);
++		else
++			insert_request_pre_stability(hctx, rq, insert_flags, &free);
 +	}} while (!stop);
 +
 +	blk_mq_free_requests(&free);
@@ -1608,7 +1610,7 @@ index 0000000000..c6eaa85911
 +	ad->batch_order = default_batch_order;
 +	ad->compliance_flags = default_compliance_flags;
 +
-+	ad->insert_request_fn = insert_request_pre_stability;
++	ad->models_stable = false;
 +
 +	atomic_set(&ad->state, 0);
 +
