@@ -1,6 +1,6 @@
-From 7e9b8f33af5f9429db69f1919ef9e6c884efa596 Mon Sep 17 00:00:00 2001
+From 0a3f218dbcc30d4edb66985af7d85bbe5e240892 Mon Sep 17 00:00:00 2001
 From: Masahito S <firelzrd@gmail.com>
-Date: Tue, 8 Sep 2026 01:04:58 +0900
+Date: Tue, 15 Sep 2026 16:43:31 +0900
 Subject: [PATCH] linux7.3-rc1-ADIOS-3.3.0
 
 ---
@@ -8,11 +8,9 @@ Subject: [PATCH] linux7.3-rc1-ADIOS-3.3.0
  block/Makefile          |    8 +
  block/adios.c           | 1986 +++++++++++++++++++++++++++++++++++++++
  block/elevator.c        |   19 +-
- localversion            |    1 +
  scripts/setlocalversion |    2 +-
- 6 files changed, 2022 insertions(+), 8 deletions(-)
+ 5 files changed, 2021 insertions(+), 8 deletions(-)
  create mode 100644 block/adios.c
- create mode 100644 localversion
 
 diff --git a/block/Kconfig.iosched b/block/Kconfig.iosched
 index 27f11320b8..e98585dd83 100644
@@ -2092,14 +2090,6 @@ index 2161b6eea6..72a0dc6b34 100644
  	elevator_put(ctx.type);
  }
  
-diff --git a/localversion b/localversion
-new file mode 100644
-index 0000000000..97f8fead68
---- /dev/null
-+++ b/localversion
-@@ -0,0 +1 @@
-+-adios
-\ No newline at end of file
 diff --git a/scripts/setlocalversion b/scripts/setlocalversion
 index 28169d7e14..5cb02894ac 100755
 --- a/scripts/setlocalversion
